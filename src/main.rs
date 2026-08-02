@@ -1,4 +1,5 @@
 mod prolog;
+mod web;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -19,15 +20,17 @@ fn main() {
         }
     };
 
-    println!(
-        "Loaded knowledge base with {} predicates.",
-        knowledge_base.predicates().len()
-    );
-
     runtime.block_on(async move {
-        let mut machine = knowledge_base.start();
-        for value in machine.run_query("role(X).") {
-            println!("{:?}", value);
+        let interpreter = knowledge_base.parse();
+        for value in interpreter.query("role(X).") {
+            match value {
+                Ok(json) => {
+                    println!("Query result: {}", json);
+                }
+                Err(error) => {
+                    eprintln!("Query error: {}", error);
+                }
+            }
         }
     })
 }

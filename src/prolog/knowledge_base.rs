@@ -1,6 +1,6 @@
 use std::{fs::File, io::Read, path::Path};
 
-use scryer_prolog::{Machine, MachineBuilder};
+use super::Interpreter;
 
 /// A knowledge base containing Prolog and ensure compatibility with file by holding a exclusive handle.
 pub struct KnowledgeBase {
@@ -21,12 +21,8 @@ impl KnowledgeBase {
         Ok(KnowledgeBase { file, file_content })
     }
 
-    pub fn start(&self) -> Machine {
-        let mut wam = MachineBuilder::default()
-            .with_toplevel(scryer_prolog::default_toplevel())
-            .build();
-        wam.load_module_string("", &self.file_content);
-        wam
+    pub fn parse(&self) -> Interpreter {
+        Interpreter::load(&self.file_content)
     }
 
     /// Returns a vector of predicates defined in the knowledge base.
