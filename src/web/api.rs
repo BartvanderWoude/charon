@@ -6,11 +6,35 @@ use axum::{
     http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use parking_lot::Mutex;
 use utoipa::openapi::{HttpMethod, Info, InfoBuilder, OpenApiBuilder, PathsBuilder};
 
-use crate::prolog::{Interpreter, ModuleDoc, Predicate};
+use crate::prolog::{DynamicPredicate, Interpreter, KnowledgeBase, ModuleDoc, Predicate};
 
 use super::Endpoint;
+
+/// Bundles a `KnowledgeBase` together with the dynamic predicates `Api` should mirror back into
+/// its source file after every request, when running with `--persist`. See
+/// `Api::with_persistence`.
+struct Persistence {
+    knowledge_base: KnowledgeBase,
+    dynamic_predicates: Vec<DynamicPredicate>,
+}
+
+impl Persistence {
+    /// Writes any `assertz`/`retract` changes visible in `interpreter`'s live state back to the
+    /// knowledge base's source file. Errors (e.g. the file became unwritable) are logged rather
+    /// than surfaced to the caller — persistence is a best-effort side effect of a request, not
+    /// something that should turn an otherwise-successful query into a failed response.
+    fn sync(&mut self, interpreter: &Interpreter) {
+        if let Err(error) = self
+            .knowledge_base
+            .persist(interpreter, &self.dynamic_predicates)
+        {
+            eprintln!("failed to persist knowledge base: {error}");
+        }
+    }
+}
 
 /// Used for `Info.title`/`Info.description` when the knowledge base has no `/** <module> ... */`
 /// comment (see `build_info`).
@@ -26,6 +50,7 @@ pub struct Api {
     endpoints: Vec<Endpoint>,
     interpreter: Interpreter,
     module_doc: Option<ModuleDoc>,
+    persistence: Option<Persistence>,
 }
 
 #[derive(Clone)]
@@ -33,6 +58,7 @@ struct AppState {
     interpreter: Interpreter,
     endpoints: Arc<Vec<Endpoint>>,
     module_doc: Arc<Option<ModuleDoc>>,
+    persistence: Option<Arc<Mutex<Persistence>>>,
 }
 
 impl Api {
@@ -48,7 +74,20 @@ impl Api {
                 .collect(),
             interpreter,
             module_doc,
+            persistence: None,
         }
+    }
+
+    /// Enables `--persist`: after every request, any `assertz`/`retract` changes visible in the
+    /// live interpreter are mirrored back into `knowledge_base`'s source file, for every
+    /// predicate it declares `dynamic`.
+    pub fn with_persistence(mut self, knowledge_base: KnowledgeBase) -> Self {
+        let dynamic_predicates = knowledge_base.dynamic_predicates();
+        self.persistence = Some(Persistence {
+            knowledge_base,
+            dynamic_predicates,
+        });
+        self
     }
 
     pub fn routes(self) -> axum::Router {
@@ -56,6 +95,7 @@ impl Api {
             interpreter: self.interpreter,
             endpoints: Arc::new(self.endpoints),
             module_doc: Arc::new(self.module_doc),
+            persistence: self.persistence.map(|p| Arc::new(Mutex::new(p))),
         };
 
         axum::Router::new()
@@ -153,11 +193,27 @@ async fn call_predicate(
     };
 
     let mut values = Vec::new();
+    let mut query_error = None;
     for answer in state.interpreter.query(&query) {
         match answer {
             Ok(value) => values.push(endpoint.extract_outputs(value)),
-            Err(error) => return json_error(StatusCode::BAD_REQUEST, error.dump()),
+            Err(error) => {
+                query_error = Some(error);
+                break;
+            }
         }
+    }
+
+    // Runs regardless of whether the query above ultimately succeeded, produced no solutions, or
+    // hit an exception: `assertz`/`retract` calls are side effects that commit to the live
+    // machine as soon as they run, even if a later goal in the same query fails or throws — so
+    // whatever changed should still be persisted.
+    if let Some(persistence) = &state.persistence {
+        persistence.lock().sync(&state.interpreter);
+    }
+
+    if let Some(error) = query_error {
+        return json_error(StatusCode::BAD_REQUEST, error.dump());
     }
 
     (

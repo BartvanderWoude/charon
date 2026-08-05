@@ -2,19 +2,21 @@ use charon::{prolog, web};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: {} <knowledge_base_file>", args[0]);
-        return;
-    }
+    let persist = args.iter().skip(1).any(|arg| arg == "--persist");
+    let path = args.iter().skip(1).find(|arg| *arg != "--persist");
 
-    let knowledge_base =
-        match prolog::KnowledgeBase::load(args.get(1).map(|s| s.as_str()).expect("valid path")) {
-            Ok(kb) => kb,
-            Err(error) => {
-                eprintln!("{}", error);
-                return;
-            }
-        };
+    let Some(path) = path else {
+        eprintln!("Usage: {} [--persist] <knowledge_base_file>", args[0]);
+        return;
+    };
+
+    let knowledge_base = match prolog::KnowledgeBase::load(path) {
+        Ok(kb) => kb,
+        Err(error) => {
+            eprintln!("{}", error);
+            return;
+        }
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -22,11 +24,14 @@ fn main() {
         .unwrap();
     runtime.block_on(async move {
         let interpreter = knowledge_base.parse();
-        let api = web::Api::new(
+        let mut api = web::Api::new(
             knowledge_base.predicates(),
             interpreter,
             knowledge_base.module_doc(),
         );
+        if persist {
+            api = api.with_persistence(knowledge_base);
+        }
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
             .await
