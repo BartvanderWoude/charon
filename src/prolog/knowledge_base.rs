@@ -4,6 +4,8 @@ use super::Interpreter;
 
 /// A knowledge base containing Prolog and ensure compatibility with file by holding a exclusive handle.
 pub struct KnowledgeBase {
+    // Never read; held only to keep an exclusive lock on the file for the KnowledgeBase's lifetime.
+    #[allow(dead_code)]
     file: File,
     file_content: String,
 }
@@ -28,6 +30,11 @@ impl KnowledgeBase {
     /// Returns a vector of predicates defined in the knowledge base.
     pub fn predicates(&self) -> Vec<super::Predicate> {
         super::Predicate::parse(&self.file_content)
+    }
+
+    /// Returns the knowledge base's file-level PlDoc module comment, if it has one.
+    pub fn module_doc(&self) -> Option<super::ModuleDoc> {
+        super::ModuleDoc::parse(&self.file_content)
     }
 }
 

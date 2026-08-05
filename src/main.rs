@@ -22,7 +22,11 @@ fn main() {
         .unwrap();
     runtime.block_on(async move {
         let interpreter = knowledge_base.parse();
-        let api = web::Api::new(knowledge_base.predicates(), interpreter);
+        let api = web::Api::new(
+            knowledge_base.predicates(),
+            interpreter,
+            knowledge_base.module_doc(),
+        );
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
             .await
