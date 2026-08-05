@@ -2,6 +2,9 @@
 name = "charon"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
+description = "Expose a Prolog knowledge base over HTTP/JSON API, with an OpenAPI description."
+publish = false
 
 [dependencies]
 axum = "0.8.9"
