@@ -4,8 +4,31 @@ use json::JsonValue;
 use parking_lot::{ReentrantMutex, RwLock};
 use scryer_prolog::{LeafAnswer, Machine, MachineBuilder, Term};
 
+/// `Machine` holds raw pointers into its own arenas, so the compiler can't
+/// see that it's safe to move between threads. It only ever gets touched
+/// through the `ReentrantMutex<RwLock<_>>` below, which serializes access,
+/// so asserting Send/Sync here is sound as long as that invariant holds.
+#[derive(Debug)]
+struct MachineHandle(Machine);
+
+unsafe impl Send for MachineHandle {}
+unsafe impl Sync for MachineHandle {}
+
+impl std::ops::Deref for MachineHandle {
+    type Target = Machine;
+    fn deref(&self) -> &Machine {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for MachineHandle {
+    fn deref_mut(&mut self) -> &mut Machine {
+        &mut self.0
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct Interpreter(Arc<ReentrantMutex<RwLock<Machine>>>);
+pub struct Interpreter(Arc<ReentrantMutex<RwLock<MachineHandle>>>);
 
 impl Interpreter {
     pub fn load(prolog_code: &str) -> Self {
@@ -13,7 +36,9 @@ impl Interpreter {
             .with_toplevel(scryer_prolog::default_toplevel())
             .build();
         wam.load_module_string("", prolog_code);
-        Interpreter(Arc::new(ReentrantMutex::new(RwLock::new(wam))))
+        Interpreter(Arc::new(ReentrantMutex::new(RwLock::new(MachineHandle(
+            wam,
+        )))))
     }
 
     pub fn query(&self, query: &str) -> Vec<Result<JsonValue, JsonValue>> {
