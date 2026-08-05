@@ -172,6 +172,66 @@ async fn openapi_json_response_is_bare_value_for_deterministic_predicates() {
 }
 
 #[tokio::test]
+async fn verb_prefixed_predicates_share_one_path_with_different_methods() {
+    let server = test_server();
+
+    // `get_fruit`/`put_fruit`/`delete_fruit` all collapse to the `/fruit` path, dispatched by
+    // HTTP method rather than by predicate name.
+    let response = server.get("/fruit").await;
+    response.assert_status_ok();
+    response.assert_json(&json!("apple"));
+
+    let response = server
+        .put("/fruit")
+        .add_query_param("Fruit", "banana")
+        .await;
+    response.assert_status_ok();
+
+    let response = server.get("/fruit").await;
+    response.assert_status_ok();
+    response.assert_json(&json!(["apple", "banana"]));
+
+    let response = server
+        .delete("/fruit")
+        .add_query_param("Fruit", "apple")
+        .await;
+    response.assert_status_ok();
+    response.assert_json(&json!(true));
+
+    let response = server.get("/fruit").await;
+    response.assert_status_ok();
+    response.assert_json(&json!("banana"));
+}
+
+#[tokio::test]
+async fn verb_prefixed_predicate_rejects_wrong_method() {
+    let server = test_server();
+
+    // `/fruit` exists (as GET/PUT/DELETE) but not as POST.
+    let response = server.post("/fruit").await;
+
+    response.assert_status(axum::http::StatusCode::METHOD_NOT_ALLOWED);
+    let body: serde_json::Value = response.json();
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn openapi_json_documents_verb_prefixed_predicates_under_shared_path() {
+    let server = test_server();
+
+    let response = server.get("/openapi.json").await;
+
+    let body: serde_json::Value = response.json();
+    let path = &body["paths"]["/fruit"];
+    assert!(path["get"].is_object());
+    assert!(path["put"].is_object());
+    assert!(path["delete"].is_object());
+    assert_eq!(path["get"]["operationId"], "get_fruit");
+    assert_eq!(path["put"]["operationId"], "put_fruit");
+    assert_eq!(path["delete"]["operationId"], "delete_fruit");
+}
+
+#[tokio::test]
 async fn openapi_json_response_allows_either_shape_for_non_deterministic_predicates() {
     let server = test_server();
 

@@ -1,6 +1,6 @@
 use json::JsonValue;
 use utoipa::openapi::{
-    ContentBuilder, Deprecated, Object, ObjectBuilder, PathsBuilder, RefOr, Required,
+    ContentBuilder, Deprecated, HttpMethod, Object, ObjectBuilder, PathsBuilder, RefOr, Required,
     ResponseBuilder, Schema,
     path::{Parameter, ParameterBuilder, ParameterIn, PathItemBuilder},
     schema::{ArrayBuilder, OneOfBuilder, SchemaType},
@@ -9,6 +9,19 @@ use utoipa::openapi::{
 use crate::prolog::{Determinism, Mode, Predicate, Type as PrologType};
 
 use std::collections::HashMap;
+
+/// Predicate-name prefixes that select an HTTP method other than the default `GET`, e.g.
+/// `put_example` is exposed as `PUT /example`. The remainder after the prefix becomes the path
+/// (grouping `get_example`/`put_example`/`delete_example` under the same `/example` path, each
+/// with its own method); a predicate with none of these prefixes keeps the old behaviour of a
+/// `GET` at its own name.
+const VERB_PREFIXES: &[(&str, HttpMethod)] = &[
+    ("get_", HttpMethod::Get),
+    ("put_", HttpMethod::Put),
+    ("post_", HttpMethod::Post),
+    ("delete_", HttpMethod::Delete),
+    ("patch_", HttpMethod::Patch),
+];
 
 /// A JSON Schema type plus the free-text description carried over from the argument's
 /// `@arg`/`@param` PlDoc tag, if any.
@@ -19,6 +32,8 @@ struct Field {
 
 pub struct Endpoint {
     raw: Predicate,
+    method: HttpMethod,
+    path_name: String,
     inputs: HashMap<String, Field>,
     outputs: HashMap<String, Field>,
 }
@@ -30,6 +45,8 @@ impl TryFrom<Predicate> for Endpoint {
         if !raw.name.is_ascii() {
             return Err(Error::InvalidName);
         }
+
+        let (method, path_name) = Self::parse_route(&raw.name);
 
         let mut inputs = HashMap::new();
         let mut outputs = HashMap::new();
@@ -60,6 +77,8 @@ impl TryFrom<Predicate> for Endpoint {
 
         Ok(Endpoint {
             raw,
+            method,
+            path_name,
             inputs,
             outputs,
         })
@@ -67,12 +86,34 @@ impl TryFrom<Predicate> for Endpoint {
 }
 
 impl Endpoint {
-    pub fn name(&self) -> &str {
-        &self.raw.name
+    /// The path this endpoint is exposed under (without the leading `/`), and the HTTP method
+    /// it responds to. Several predicates can share a path by differing only in their verb
+    /// prefix, e.g. `get_example`/`put_example`/`delete_example` all resolve to `example`.
+    pub fn path_name(&self) -> &str {
+        &self.path_name
+    }
+
+    pub fn method(&self) -> &HttpMethod {
+        &self.method
+    }
+
+    /// Splits a predicate name into its HTTP method and path name, based on a recognised verb
+    /// prefix (`get_`/`put_`/`post_`/`delete_`/`patch_`). Predicates without one of these
+    /// prefixes (or where the prefix consumes the whole name) keep the old behaviour: `GET` at
+    /// the predicate's own name.
+    fn parse_route(name: &str) -> (HttpMethod, String) {
+        for (prefix, method) in VERB_PREFIXES {
+            if let Some(rest) = name.strip_prefix(prefix)
+                && !rest.is_empty()
+            {
+                return (method.clone(), rest.to_string());
+            }
+        }
+        (HttpMethod::Get, name.to_string())
     }
 
     pub fn add(&self, builder: PathsBuilder) -> PathsBuilder {
-        let path = format!("/{}", self.raw.name);
+        let path = format!("/{}", self.path_name);
 
         let mut operation_builder = utoipa::openapi::path::OperationBuilder::new();
         operation_builder = operation_builder
@@ -176,8 +217,7 @@ impl Endpoint {
         );
         operation_builder = operation_builder.response("400", Self::error_response());
 
-        let path_builder =
-            PathItemBuilder::new().operation(utoipa::openapi::HttpMethod::Get, operation_builder);
+        let path_builder = PathItemBuilder::new().operation(self.method.clone(), operation_builder);
 
         builder.path(path, path_builder.build())
     }
@@ -241,8 +281,9 @@ impl Endpoint {
     /// parameters of the request, e.g. `my_length([1,2,3], Length).`.
     ///
     /// Each input's declared type controls how its query-string value is read: `int`/`float`
-    /// parse as numbers, `atom` is taken verbatim as a string, and `list`/`any` are parsed as
-    /// JSON first (so `List=[1,2,3]` works) and fall back to a plain atom otherwise.
+    /// parse as numbers, `atom` is taken verbatim as a quoted Prolog atom (so it unifies with
+    /// plain atom facts, e.g. `example(a)`, rather than a double-quoted string), and `list`/`any`
+    /// are parsed as JSON first (so `List=[1,2,3]` works) and fall back to a plain atom otherwise.
     pub fn build_query(&self, params: &HashMap<String, String>) -> Result<String, QueryError> {
         let mut terms = Vec::with_capacity(self.raw.arguments.len());
         for argument in self.raw.arguments.iter() {
@@ -251,12 +292,15 @@ impl Endpoint {
                     let raw = params
                         .get(argument.name.as_str())
                         .ok_or_else(|| QueryError::MissingArgument(argument.name.clone()))?;
-                    let value = Self::parse_query_value(&argument.param_type, raw)
-                        .ok_or_else(|| QueryError::UnsupportedValue(argument.name.clone()))?;
-                    terms.push(
+                    let term = if argument.param_type == PrologType::Atom {
+                        Self::atom_term(raw)
+                    } else {
+                        let value = Self::parse_query_value(&argument.param_type, raw)
+                            .ok_or_else(|| QueryError::UnsupportedValue(argument.name.clone()))?;
                         Self::json_to_term(&value)
-                            .ok_or_else(|| QueryError::UnsupportedValue(argument.name.clone()))?,
-                    );
+                            .ok_or_else(|| QueryError::UnsupportedValue(argument.name.clone()))?
+                    };
+                    terms.push(term);
                 }
                 Some(Mode::Output) => terms.push(Self::variable_name(&argument.name)),
                 _ => unreachable!("Endpoint construction only allows Input/Output arguments"),
@@ -335,6 +379,13 @@ impl Endpoint {
             Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
             None => String::new(),
         }
+    }
+
+    /// Encodes a raw string as a quoted Prolog atom literal, e.g. `foo` becomes `'foo'`. Always
+    /// quoting (rather than only when needed) sidesteps having to replicate Prolog's unquoted-atom
+    /// grammar here.
+    fn atom_term(raw: &str) -> String {
+        format!("'{}'", raw.replace('\\', "\\\\").replace('\'', "\\'"))
     }
 
     fn json_to_term(value: &JsonValue) -> Option<String> {

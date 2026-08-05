@@ -35,3 +35,16 @@ old_pred(_).
 color(red).
 color(green).
 color(blue).
+
+:- dynamic(fruit/1).
+
+fruit(apple).
+
+%! get_fruit(-Fruit:atom) is multi.
+get_fruit(Fruit) :- fruit(Fruit).
+
+%! put_fruit(+Fruit:atom) is det.
+put_fruit(Fruit) :- assertz(fruit(Fruit)).
+
+%! delete_fruit(+Fruit:atom) is semidet.
+delete_fruit(Fruit) :- fruit(Fruit), retract(fruit(Fruit)).

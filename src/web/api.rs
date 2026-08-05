@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use utoipa::openapi::{Info, InfoBuilder, OpenApiBuilder, PathsBuilder};
+use utoipa::openapi::{HttpMethod, Info, InfoBuilder, OpenApiBuilder, PathsBuilder};
 
 use crate::prolog::{Interpreter, ModuleDoc, Predicate};
 
@@ -16,9 +16,11 @@ use super::Endpoint;
 /// comment (see `build_info`).
 const DEFAULT_TITLE: &str = "Charon Knowledge Base API";
 const DEFAULT_DESCRIPTION: &str = "Generated from a Prolog knowledge base: every endpoint \
-     corresponds to a predicate documented with a PlDoc `%!` comment. GET the input arguments as \
-     query parameters to run the query; the response is the bare result if the query has \
-     exactly one solution, otherwise a JSON array with one entry per solution.";
+     corresponds to a predicate documented with a PlDoc `%!` comment, exposed as GET by default \
+     or under a `get_`/`put_`/`post_`/`delete_`/`patch_` name prefix otherwise (e.g. `put_example` \
+     is exposed as `PUT /example`). Pass the input arguments as query parameters to run the \
+     query; the response is the bare result if the query has exactly one solution, otherwise a \
+     JSON array with one entry per solution.";
 
 pub struct Api {
     endpoints: Vec<Endpoint>,
@@ -58,7 +60,14 @@ impl Api {
 
         axum::Router::new()
             .route("/openapi.json", axum::routing::get(get_openapi_json))
-            .route("/{predicate}", axum::routing::get(call_predicate))
+            .route(
+                "/{predicate}",
+                axum::routing::get(call_predicate)
+                    .put(call_predicate)
+                    .post(call_predicate)
+                    .delete(call_predicate)
+                    .patch(call_predicate),
+            )
             .with_state(state)
     }
 
@@ -115,16 +124,26 @@ async fn get_openapi_json(State(state): State<AppState>) -> impl IntoResponse {
 async fn call_predicate(
     State(state): State<AppState>,
     Path(predicate): Path<String>,
+    method: Method,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(endpoint) = state
+    let mut matching_path = state
         .endpoints
         .iter()
-        .find(|endpoint| endpoint.name() == predicate)
-    else {
+        .filter(|endpoint| endpoint.path_name() == predicate)
+        .peekable();
+    if matching_path.peek().is_none() {
         return json_error(
             StatusCode::NOT_FOUND,
             format!("unknown predicate: {predicate}"),
+        );
+    }
+
+    let Some(endpoint) = matching_path.find(|endpoint| method_matches(endpoint.method(), &method))
+    else {
+        return json_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            format!("method not allowed for: {predicate}"),
         );
     };
 
@@ -146,6 +165,21 @@ async fn call_predicate(
         Endpoint::finalize_response(values).dump(),
     )
         .into_response()
+}
+
+/// Whether an endpoint's documented `HttpMethod` (from OpenAPI) corresponds to the HTTP method
+/// of an incoming request.
+fn method_matches(endpoint_method: &HttpMethod, method: &Method) -> bool {
+    match endpoint_method {
+        HttpMethod::Get => method == Method::GET,
+        HttpMethod::Post => method == Method::POST,
+        HttpMethod::Put => method == Method::PUT,
+        HttpMethod::Delete => method == Method::DELETE,
+        HttpMethod::Options => method == Method::OPTIONS,
+        HttpMethod::Head => method == Method::HEAD,
+        HttpMethod::Patch => method == Method::PATCH,
+        HttpMethod::Trace => method == Method::TRACE,
+    }
 }
 
 /// Builds a `{"error": message}` JSON response, matching the error schema documented for every
