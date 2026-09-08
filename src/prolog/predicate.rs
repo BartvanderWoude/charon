@@ -35,13 +35,24 @@ impl fmt::Display for Mode {
     }
 }
 
+/// The declared type of a predicate argument.
+///
+/// The distinction between `Atom` and `String` is what removes the need for knowledge bases to
+/// normalise names by hand: a JSON string becomes a Prolog atom (`'diazepam'`) or a Prolog
+/// string (`"diazepam"`) according to what was declared, rather than according to whether it
+/// arrived as a scalar or inside a list. `List` carries its element type for the same reason —
+/// `list(atom)` is what makes `["diazepam"]` unify with an ordinary `pim(diazepam, …)` fact.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Type {
     Any,
     Atom,
+    /// A Prolog string, i.e. a list of characters under scryer's default `double_quotes` flag.
+    Text,
     Integer,
     Float,
-    List,
+    Boolean,
+    /// A list, with the type of its elements. Bare `list` parses as `List(Box::new(Type::Any))`.
+    List(Box<Type>),
     Compound,
     Stream,
     Custom(String),
@@ -51,12 +62,27 @@ impl FromStr for Type {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        // A parameterised type: `list(atom)`, `list(list(int))`, ...
+        if let Some(open) = s.find('(')
+            && let Some(inner) = s.strip_suffix(')')
+        {
+            let (constructor, _) = s.split_at(open);
+            let inner = &inner[open + 1..];
+            return match constructor.trim().to_lowercase().as_str() {
+                "list" => Ok(Type::List(Box::new(inner.parse()?))),
+                _ => Ok(Type::Custom(s.to_string())),
+            };
+        }
+
         match s.to_lowercase().as_str() {
             "any" => Ok(Type::Any),
             "atom" => Ok(Type::Atom),
+            "string" | "text" => Ok(Type::Text),
             "int" | "integer" => Ok(Type::Integer),
             "float" | "number" => Ok(Type::Float),
-            "list" => Ok(Type::List),
+            "bool" | "boolean" => Ok(Type::Boolean),
+            "list" => Ok(Type::List(Box::new(Type::Any))),
             "compound" => Ok(Type::Compound),
             "stream" => Ok(Type::Stream),
             other => Ok(Type::Custom(other.to_string())),
@@ -69,9 +95,12 @@ impl fmt::Display for Type {
         match self {
             Type::Any => write!(f, "any"),
             Type::Atom => write!(f, "atom"),
+            Type::Text => write!(f, "string"),
             Type::Integer => write!(f, "int"),
             Type::Float => write!(f, "float"),
-            Type::List => write!(f, "list"),
+            Type::Boolean => write!(f, "boolean"),
+            Type::List(element) if **element == Type::Any => write!(f, "list"),
+            Type::List(element) => write!(f, "list({element})"),
             Type::Compound => write!(f, "compound"),
             Type::Stream => write!(f, "stream"),
             Type::Custom(custom) => write!(f, "{}", custom),
@@ -251,23 +280,137 @@ pub struct Predicate {
     pub doc: Doc,
 }
 
+/// The three things a `%!` mode line states.
+struct Signature {
+    name: String,
+    arguments: Vec<Argument>,
+    determinism: Option<Determinism>,
+}
+
+/// Parses a PlDoc mode line: `%! name(+In:type, -Out:list(atom)) is det.`
+///
+/// This is a scanner rather than a regular expression because argument types nest: a pattern
+/// like `\(([^)]*)\)` stops at the first closing parenthesis, so it truncates the argument list
+/// of `%! f(+Xs:list(atom))` and silently mangles the whole line. The parenthesised argument
+/// list is optional, so `%! ready is det.` documents a zero-arity predicate.
+fn parse_mode_line(line: &str) -> Option<Signature> {
+    let rest = line.trim_start().strip_prefix("%!")?;
+    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    let (name, mut rest) = rest.split_at(name_end);
+    if name.is_empty() {
+        return None;
+    }
+    rest = rest.trim_start();
+
+    let mut arguments = Vec::new();
+    if let Some(after_open) = rest.strip_prefix('(') {
+        let close = matching_paren(after_open)?;
+        arguments = split_arguments(&after_open[..close])
+            .into_iter()
+            .map(parse_argument)
+            .collect();
+        rest = after_open[close + 1..].trim_start();
+    }
+
+    // `is <determinism>`, then an optional trailing full stop, then nothing else.
+    let determinism = match rest.strip_prefix("is ") {
+        Some(tail) => {
+            let tail = tail.trim_start();
+            let word_end = tail
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(tail.len());
+            let (word, tail) = tail.split_at(word_end);
+            rest = tail.trim_start();
+            word.parse().ok()
+        }
+        None => None,
+    };
+
+    if !rest.trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+
+    Some(Signature {
+        name: name.to_string(),
+        arguments,
+        determinism,
+    })
+}
+
+/// The index of the `)` closing a parenthesised group whose opening `(` has already been
+/// consumed, or `None` if it is never closed.
+fn matching_paren(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' if depth == 0 => return Some(index),
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Splits an argument list on the commas that separate arguments, ignoring commas nested inside
+/// a parameterised type such as `pair(int,atom)`.
+fn split_arguments(list: &str) -> Vec<&str> {
+    let mut arguments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in list.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                arguments.push(&list[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(&list[start..]);
+    arguments
+        .into_iter()
+        .map(str::trim)
+        .filter(|argument| !argument.is_empty())
+        .collect()
+}
+
+/// Parses one argument: an optional mode sigil, a name, and an optional `:type`.
+fn parse_argument(argument: &str) -> Argument {
+    let argument = argument.trim();
+    let (mode, rest) = match argument.chars().next() {
+        Some(sigil) if "+-?@".contains(sigil) => (
+            sigil.to_string().parse::<Mode>().ok(),
+            argument[sigil.len_utf8()..].trim_start(),
+        ),
+        _ => (None, argument),
+    };
+
+    let (name, param_type) = match rest.split_once(':') {
+        Some((name, declared)) => (
+            name.trim(),
+            declared.trim().parse::<Type>().unwrap_or(Type::Any),
+        ),
+        None => (rest.trim(), Type::Any),
+    };
+
+    Argument {
+        name: name.to_string(),
+        mode,
+        param_type,
+        description: None,
+    }
+}
+
 impl Predicate {
-    pub(super) fn parse(source_code: &str) -> Vec<Predicate> {
-        // Matches a "%! name(args...) [is determinism]." mode line in full.
-        let signature_re = Regex::new(
-            r"(?x)
-            ^\s*%!\s+
-            ([a-zA-Z0-9_]+)\s*\(([^)]*)\)
-            \s*(?:is\s+([a-zA-Z]+))?
-            \s*\.?\s*$
-            ",
-        )
-        .unwrap();
-
-        // Matches mode (+/-/?/@), variable name, and optional :type
-        let arg_re =
-            Regex::new(r"([+\-?@])?\s*([a-zA-Z0-9_]+)(?:\s*:\s*([a-zA-Z0-9_]+))?").unwrap();
-
+    /// Every predicate the source documents with a `%!` PlDoc comment, in file order.
+    pub fn parse(source_code: &str) -> Vec<Predicate> {
         // Matches a "@tag rest-of-line" doc tag.
         let tag_re = Regex::new(r"^@(\w+)(?:\s+(.*))?$").unwrap();
 
@@ -275,38 +418,21 @@ impl Predicate {
         let mut predicates = Vec::new();
         let mut i = 0;
         while i < lines.len() {
-            let Some(cap) = signature_re.captures(lines[i]) else {
+            let Some(signature) = parse_mode_line(lines[i]) else {
                 i += 1;
                 continue;
             };
 
-            let name = cap[1].to_string();
-            let args_str = cap[2].to_string();
-            let determinism = cap.get(3).and_then(|m| m.as_str().parse().ok());
-
-            let mut arguments: Vec<Argument> = arg_re
-                .captures_iter(&args_str)
-                .map(|arg_cap| {
-                    let mode = arg_cap.get(1).and_then(|m| m.as_str().parse::<Mode>().ok());
-                    let name = arg_cap[2].to_string();
-                    let param_type = arg_cap
-                        .get(3)
-                        .and_then(|t| t.as_str().parse::<Type>().ok())
-                        .unwrap_or(Type::Any);
-
-                    Argument {
-                        name,
-                        mode,
-                        param_type,
-                        description: None,
-                    }
-                })
-                .collect();
+            let Signature {
+                name,
+                mut arguments,
+                determinism,
+            } = signature;
 
             i += 1;
             // PlDoc allows several mode lines (one per calling pattern) to document one
             // predicate; skip any further ones directly below the first.
-            while i < lines.len() && signature_re.is_match(lines[i]) {
+            while i < lines.len() && parse_mode_line(lines[i]).is_some() {
                 i += 1;
             }
 
@@ -446,7 +572,8 @@ pub struct ModuleDoc {
 }
 
 impl ModuleDoc {
-    pub(super) fn parse(source_code: &str) -> Option<ModuleDoc> {
+    /// The file-level `/** <module> … */` comment, if the source has one.
+    pub fn parse(source_code: &str) -> Option<ModuleDoc> {
         // Find the "/** <module>" opener, then the comment's closing "*/" (Prolog block
         // comments don't nest, so the first one found ends it).
         let marker_re = Regex::new(r"/\*\*[ \t]*<module>[ \t]*").unwrap();
@@ -493,7 +620,13 @@ mod tests {
         assert_eq!("float".parse::<Type>(), Ok(Type::Float));
         assert_eq!("number".parse::<Type>(), Ok(Type::Float));
         assert_eq!("atom".parse::<Type>(), Ok(Type::Atom));
-        assert_eq!("list".parse::<Type>(), Ok(Type::List));
+        assert_eq!("list".parse::<Type>(), Ok(Type::List(Box::new(Type::Any))));
+        assert_eq!(
+            "list(atom)".parse::<Type>(),
+            Ok(Type::List(Box::new(Type::Atom)))
+        );
+        assert_eq!("string".parse::<Type>(), Ok(Type::Text));
+        assert_eq!("boolean".parse::<Type>(), Ok(Type::Boolean));
         assert_eq!("any".parse::<Type>(), Ok(Type::Any));
 
         // Custom types
@@ -531,7 +664,7 @@ mod tests {
                 Argument {
                     name: "List".to_string(),
                     mode: Some(Mode::Input),
-                    param_type: Type::List,
+                    param_type: Type::List(Box::new(Type::Any)),
                     description: None,
                 },
                 Argument {

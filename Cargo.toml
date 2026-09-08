@@ -1,21 +1,23 @@
 [package]
 name = "charon"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
-description = "Expose a Prolog knowledge base over HTTP/JSON API, with an OpenAPI description."
+description = "Expose a Prolog knowledge base as an HTTP/JSON API or as an MCP server, described by PlDoc comments."
 publish = false
 
 [dependencies]
 axum = "0.8.9"
-json = "0.12.4"
+clap = { version = "4.6.6", features = ["derive"] }
 parking_lot = "0.12.5"
 regex = "1.13.1"
 scryer-prolog = { git = "https://github.com/mthom/scryer-prolog.git", default-features = false, rev = "295a642" }
-tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
-utoipa = "5.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "io-std", "io-util", "macros", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 axum-test = "21.0.0"
-serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["macros"] }
