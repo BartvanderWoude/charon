@@ -678,8 +678,8 @@ async fn a_bool_output_answers_with_a_json_boolean_and_not_the_word() {
     // failed validation against its own description of itself — and a client that branched on
     // the value got a truthy string either way.
     let document: Value = server.get("/openapi.json").await.json();
-    let schema = &document["paths"]["/is_even"]["get"]["responses"]["200"]["content"]
-        ["application/json"]["schema"];
+    let schema = &document["paths"]["/is_even"]["get"]["responses"]["200"]["content"]["application/json"]
+        ["schema"];
     assert_eq!(schema["type"], "boolean", "the document promises a boolean");
 
     let even: Value = server

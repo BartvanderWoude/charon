@@ -37,7 +37,10 @@ pub fn json_for(value: Value, declared: &Type) -> Value {
         },
         Type::List(element) => match value {
             Value::Array(items) => Value::Array(
-                items.into_iter().map(|item| json_for(item, element)).collect(),
+                items
+                    .into_iter()
+                    .map(|item| json_for(item, element))
+                    .collect(),
             ),
             other => other,
         },
