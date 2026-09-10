@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::service::Service;
+use super::Server;
 
 /// Serves MCP over stdin/stdout until the client closes the stream.
-pub async fn serve_stdio(service: Arc<Service>) -> std::io::Result<()> {
+pub async fn serve_stdio(server: Arc<Server>) -> std::io::Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     tracing::info!("serving MCP over stdio");
@@ -31,7 +31,7 @@ pub async fn serve_stdio(service: Arc<Service>) -> std::io::Result<()> {
         }
 
         let response = match serde_json::from_str(&line) {
-            Ok(request) => super::handle(&service, &request).await,
+            Ok(request) => super::handle(&server, &request).await,
             Err(error) => {
                 tracing::warn!(%error, "received a line that is not JSON");
                 Some(super::parse_error())

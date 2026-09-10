@@ -9,13 +9,19 @@ mod common;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use charon::mcp::Server;
 use charon::service::Service;
 use common::{api, mcp_server};
 use serde_json::{Value, json};
 
-async fn request(service: &Arc<Service>, method: &str, params: Value) -> Value {
+/// The dispatcher over a fixture, which is what most of these tests drive directly.
+fn server(service: &Arc<Service>) -> Arc<Server> {
+    Server::new(Arc::clone(service))
+}
+
+async fn request(server: &Arc<Server>, method: &str, params: Value) -> Value {
     let response = charon::mcp::handle(
-        service,
+        server,
         &json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }),
     )
     .await
@@ -25,8 +31,8 @@ async fn request(service: &Arc<Service>, method: &str, params: Value) -> Value {
     response
 }
 
-async fn result(service: &Arc<Service>, method: &str, params: Value) -> Value {
-    let response = request(service, method, params).await;
+async fn result(server: &Arc<Server>, method: &str, params: Value) -> Value {
+    let response = request(server, method, params).await;
     assert!(
         response.get("error").is_none(),
         "unexpected error: {response}"
@@ -40,7 +46,7 @@ async fn result(service: &Arc<Service>, method: &str, params: Value) -> Value {
 
 #[tokio::test]
 async fn initialize_advertises_tools_and_resources() {
-    let service = api();
+    let service = server(&api());
     let result = result(&service, "initialize", json!({})).await;
 
     assert_eq!(result["protocolVersion"], charon::mcp::PROTOCOL_VERSION);
@@ -52,7 +58,7 @@ async fn initialize_advertises_tools_and_resources() {
 
 #[tokio::test]
 async fn initialize_answers_in_the_revision_the_client_asked_for() {
-    let service = api();
+    let service = server(&api());
 
     // Telling a 2024-11-05 client that the session is 2025-06-18 asks it to understand a
     // protocol it does not know.
@@ -76,13 +82,13 @@ async fn initialize_answers_in_the_revision_the_client_asked_for() {
 
 #[tokio::test]
 async fn ping_is_answered_with_an_empty_result() {
-    let service = api();
+    let service = server(&api());
     assert_eq!(result(&service, "ping", json!({})).await, json!({}));
 }
 
 #[tokio::test]
 async fn notifications_are_not_answered() {
-    let service = api();
+    let service = server(&api());
 
     // No `id`, so by JSON-RPC convention there must be no response at all.
     let response = charon::mcp::handle(
@@ -95,7 +101,7 @@ async fn notifications_are_not_answered() {
 
 #[tokio::test]
 async fn a_batch_is_answered_with_a_batch() {
-    let service = api();
+    let service = server(&api());
 
     // A JSON-RPC array used to fall through the `id` lookup and be treated as a notification, so
     // a batching client got silence.
@@ -119,7 +125,7 @@ async fn a_batch_is_answered_with_a_batch() {
 
 #[tokio::test]
 async fn a_batch_of_only_notifications_is_answered_with_silence() {
-    let service = api();
+    let service = server(&api());
     let response = charon::mcp::handle(
         &service,
         &json!([{ "jsonrpc": "2.0", "method": "notifications/initialized" }]),
@@ -130,7 +136,7 @@ async fn a_batch_of_only_notifications_is_answered_with_silence() {
 
 #[tokio::test]
 async fn malformed_messages_are_refused_by_code() {
-    let service = api();
+    let service = server(&api());
 
     assert_eq!(
         request(&service, "nonsense/method", json!({})).await["error"]["code"],
@@ -150,7 +156,9 @@ async fn malformed_messages_are_refused_by_code() {
 
 #[tokio::test]
 async fn tools_keep_their_predicate_names_including_verb_prefixes() {
-    let service = api();
+    // Writable, so the changing operations are on the list at all to be named.
+    let writable = common::Persisting::fixture("api_test.pl", "mcp_tool_names");
+    let service = server(&writable.service);
     let result = result(&service, "tools/list", json!({})).await;
     let names: Vec<&str> = result["tools"]
         .as_array()
@@ -170,7 +178,8 @@ async fn tools_keep_their_predicate_names_including_verb_prefixes() {
 
 #[tokio::test]
 async fn verb_prefixes_become_behavioural_annotations() {
-    let service = api();
+    let writable = common::Persisting::fixture("api_test.pl", "mcp_annotations");
+    let service = server(&writable.service);
     let result = result(&service, "tools/list", json!({})).await;
     let tools = result["tools"].as_array().unwrap().clone();
     let tool = |name: &str| {
@@ -193,7 +202,7 @@ async fn verb_prefixes_become_behavioural_annotations() {
 
 #[tokio::test]
 async fn tool_schemas_match_the_declared_types() {
-    let service = api();
+    let service = server(&api());
     let result = result(&service, "tools/list", json!({})).await;
     let tools = result["tools"].as_array().unwrap().clone();
     let tool = tools
@@ -216,7 +225,7 @@ async fn tool_schemas_match_the_declared_types() {
 
 #[tokio::test]
 async fn calling_a_tool_returns_text_and_structured_content() {
-    let service = api();
+    let service = server(&api());
     let result = result(
         &service,
         "tools/call",
@@ -232,7 +241,7 @@ async fn calling_a_tool_returns_text_and_structured_content() {
 
 #[tokio::test]
 async fn mcp_arguments_are_passed_through_already_typed() {
-    let service = api();
+    let service = server(&api());
 
     // No query-string coercion is involved on this path: the array arrives as an array.
     let result = result(
@@ -253,7 +262,7 @@ async fn mcp_arguments_are_passed_through_already_typed() {
 
 #[tokio::test]
 async fn a_tool_taking_no_arguments_can_be_called_without_them() {
-    let service = api();
+    let service = server(&api());
 
     for params in [
         json!({ "name": "ready" }),
@@ -271,7 +280,7 @@ async fn a_tool_taking_no_arguments_can_be_called_without_them() {
 
 #[tokio::test]
 async fn a_prolog_exception_is_a_tool_error_not_a_protocol_error() {
-    let service = api();
+    let service = server(&api());
     let response = request(
         &service,
         "tools/call",
@@ -295,7 +304,7 @@ async fn a_prolog_exception_is_a_tool_error_not_a_protocol_error() {
 
 #[tokio::test]
 async fn an_exception_over_mcp_does_not_poison_later_calls() {
-    let service = api();
+    let service = server(&api());
 
     request(
         &service,
@@ -315,7 +324,7 @@ async fn an_exception_over_mcp_does_not_poison_later_calls() {
 
 #[tokio::test]
 async fn a_bad_tool_call_is_refused_by_code() {
-    let service = api();
+    let service = server(&api());
 
     let unknown = request(
         &service,
@@ -343,7 +352,7 @@ async fn a_bad_tool_call_is_refused_by_code() {
 
 #[tokio::test]
 async fn the_knowledge_base_source_is_readable_as_a_resource() {
-    let service = api();
+    let service = server(&api());
 
     let listing = result(&service, "resources/list", json!({})).await;
     assert_eq!(listing["resources"][0]["uri"], "charon://source");
@@ -361,7 +370,7 @@ async fn the_knowledge_base_source_is_readable_as_a_resource() {
 
 #[tokio::test]
 async fn an_unknown_resource_is_refused() {
-    let service = api();
+    let service = server(&api());
     let response = request(
         &service,
         "resources/read",
@@ -434,6 +443,7 @@ async fn the_rest_interface_is_absent_from_the_mcp_server() {
 #[tokio::test]
 async fn both_interfaces_shape_solutions_identically() {
     let service = api();
+    let server = server(&service);
     let catalog = service.catalog();
 
     // The same operation, called through the service the way each transport calls it, has to
@@ -447,11 +457,111 @@ async fn both_interfaces_shape_solutions_identically() {
         .expect("call should succeed");
 
     let over_mcp = result(
-        &service,
+        &server,
         "tools/call",
         json!({ "name": "pim_hits", "arguments": { "Drugs": ["diazepam"] } }),
     )
     .await;
 
-    assert_eq!(direct, over_mcp["structuredContent"]["solutions"]);
+    assert_eq!(direct.value, over_mcp["structuredContent"]["solutions"]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Streamable HTTP transport
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_cross_origin_request_is_refused() {
+    // A web page cannot read from a loopback port, but it can be made to POST to one. Charon has
+    // no authentication at all, so refusing the request outright is the only thing between a
+    // knowledge base bound to localhost and any page the user happens to have open.
+    let server = common::mcp_server("api_test.pl");
+
+    let refused = server
+        .post("/mcp")
+        .add_header("origin", "https://evil.example")
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await;
+    refused.assert_status(StatusCode::FORBIDDEN);
+
+    // A local origin, and no origin at all, are both fine.
+    for origin in ["http://localhost:3000", "http://127.0.0.1:8080"] {
+        server
+            .post("/mcp")
+            .add_header("origin", origin)
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }))
+            .await
+            .assert_status_ok();
+    }
+    server
+        .post("/mcp")
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }))
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn a_protocol_version_the_server_does_not_speak_is_refused() {
+    // Better than answering in a dialect the client will misread.
+    let server = common::mcp_server("api_test.pl");
+
+    server
+        .post("/mcp")
+        .add_header("mcp-protocol-version", "1999-01-01")
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }))
+        .await
+        .assert_status_bad_request();
+
+    server
+        .post("/mcp")
+        .add_header("mcp-protocol-version", charon::mcp::PROTOCOL_VERSION)
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }))
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn a_session_is_issued_on_the_handshake_and_not_before() {
+    let server = common::mcp_server("api_test.pl");
+
+    let handshake = server
+        .post("/mcp")
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }))
+        .await;
+    handshake.assert_status_ok();
+    assert!(
+        handshake.headers().get("mcp-session-id").is_some(),
+        "initialize should issue a session"
+    );
+
+    let later = server
+        .post("/mcp")
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "ping" }))
+        .await;
+    assert!(later.headers().get("mcp-session-id").is_none());
+}
+
+#[tokio::test]
+async fn there_is_no_event_stream_and_the_server_says_so() {
+    // Leaving GET unrouted would look like a broken deployment; Charon simply has nothing to
+    // push, since the tool list is fixed for the life of a process.
+    let server = common::mcp_server("api_test.pl");
+    let response = server.get("/mcp").await;
+
+    response.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers()["allow"].to_str().unwrap(), "POST");
+}
+
+#[tokio::test]
+async fn the_handshake_advertises_what_this_server_can_actually_do() {
+    let service = server(&api());
+    let result = result(&service, "initialize", json!({})).await;
+    let capabilities = &result["capabilities"];
+
+    for capability in ["tools", "resources", "prompts", "logging", "completions"] {
+        assert!(
+            capabilities.get(capability).is_some(),
+            "{capability} missing from {capabilities}"
+        );
+    }
 }

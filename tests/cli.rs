@@ -92,11 +92,12 @@ fn check_fails_on_a_knowledge_base_whose_consult_failed() {
     let output = run(&["check", fixture("broken.pl").to_str().unwrap()]);
 
     assert!(!output.status.success());
-    assert!(
-        stderr_of(&output).contains("healthy/1"),
-        "{}",
-        stderr_of(&output)
-    );
+    let stderr = stderr_of(&output);
+    // Detected by a sentinel consulted after the knowledge base rather than by probing the
+    // documented predicates, which has a blind spot: a bad clause for a predicate that also has
+    // good clauses leaves `current_predicate` answering true for it.
+    assert!(stderr.contains("did not load completely"), "{stderr}");
+    assert!(stderr.contains("aborts scryer's consult"), "{stderr}");
 }
 
 #[test]
@@ -230,4 +231,35 @@ fn stdio_keeps_stdout_clean_when_a_line_is_not_json() {
     assert_eq!(parse_error["error"]["code"], -32700);
     let pong: Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(pong["id"], 7);
+}
+
+#[test]
+fn check_names_the_operations_it_is_withholding() {
+    // Forgetting `--persist` is by far the likeliest reason for an endpoint to go missing, so
+    // the absence has to be diagnosable rather than mysterious — the same standard the
+    // "documented but not exposed" report already sets.
+    let output = run(&["check", fixture("api_test.pl").to_str().unwrap()]);
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for withheld in ["put_fruit", "delete_fruit", "post_note"] {
+        assert!(
+            stderr.contains(withheld),
+            "{withheld} unreported in: {stderr}"
+        );
+    }
+    assert!(stderr.contains("--persist"), "{stderr}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("withheld"), "{stdout}");
+
+    // With the flag, nothing is withheld and the summary says so.
+    let output = run(&[
+        "check",
+        fixture("api_test.pl").to_str().unwrap(),
+        "--persist",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("withheld"), "{stdout}");
 }

@@ -16,12 +16,12 @@
 //! let catalog = service.catalog();
 //!
 //! let arguments = serde_json::json!({ "List": [1, 2, 3] });
-//! let solutions = service.call_blocking(
+//! let outcome = service.call_blocking(
 //!     &catalog,
 //!     "list_length",
 //!     arguments.as_object().unwrap(),
 //! )?;
-//! assert_eq!(solutions, serde_json::json!(3));
+//! assert_eq!(outcome.value, serde_json::json!(3));
 //! # Ok(())
 //! # }
 //! ```

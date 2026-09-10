@@ -5,12 +5,12 @@ use serde_json::{Map, Value};
 
 /// Converts a term to JSON, the representation Charon speaks on both of its interfaces.
 ///
-/// Integers stay integers: routing them through `f64` (as this used to) turns every count and
-/// identifier in a response into a float, which is both ugly and lossy for large values.
+/// Integers stay integers: routing them through `f64` would turn every count and identifier in a
+/// response into a float, which is both ugly and lossy for large values.
 ///
 /// The mapping is deliberately lossy in one direction — an atom and a string both become a JSON
-/// string — because a caller reading a response wants the text, not the term's provenance. What
-/// an argument *becomes* on the way in is decided by its declared type instead
+/// string — because a caller reading a response wants the text rather than the term's
+/// provenance. What an argument *becomes* on the way in is decided by its declared type instead
 /// (see [`crate::service`]).
 pub(crate) fn to_json(term: Term) -> Value {
     match term {
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn control_characters_are_escaped_rather_than_ending_the_term() {
         // An unescaped newline closes nothing and breaks the generated goal; worse, a caller
-        // could once end a quote and continue with Prolog of their own.
+        // could end a quote and continue with Prolog of their own.
         assert_eq!(quote_atom("a\nb"), r"'a\nb'");
         assert_eq!(quote_string("a\nb"), r#""a\nb""#);
         assert_eq!(quote_atom("tab\there"), r"'tab\there'");

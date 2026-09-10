@@ -1,22 +1,24 @@
 //! One callable predicate, described independently of any transport.
 //!
-//! An `Operation` knows how to turn JSON arguments into a Prolog goal and the resulting answers
-//! back into JSON, and it can describe its own input and output shapes as JSON Schema. The verb it
-//! carries is a neutral hint that each adapter reads in its own way, rather than an OpenAPI type
-//! used as the internal representation.
+//! An `Operation` turns JSON arguments into a Prolog goal and the resulting answers back into
+//! JSON. Everything a descriptor needs — the argument list, the schemas, the prose, the verb —
+//! is settled when the operation is built, so rendering a document never has to consult the
+//! knowledge base or handle a case that construction already ruled out.
 
 use std::fmt;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 use super::marshal::{self, TypeMismatch};
 use super::schema;
-use crate::prolog::{Answer, Determinism, Mode, Predicate, PrologError, Type, quote_atom};
+use crate::prolog::{
+    Answer, Determinism, DomainSource, Mode, Predicate, PrologError, Type, quote_atom,
+};
 
 /// The intent a predicate's name prefix declares.
 ///
-/// HTTP reads this as a method and strips the prefix from the path; MCP reads it as tool
-/// annotations and keeps the full predicate name. One convention, two readings.
+/// HTTP reads it as a method and strips the prefix from the path; MCP keeps the full predicate
+/// name and reads the prefix as tool annotations. One convention, two readings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Verb {
     Get,
@@ -30,7 +32,11 @@ impl Verb {
     /// Every verb, in the order a descriptor should list them.
     pub const ALL: [Verb; 5] = [Verb::Get, Verb::Put, Verb::Post, Verb::Delete, Verb::Patch];
 
-    /// Whether calling this can be assumed to leave the knowledge base unchanged.
+    /// Whether calling this leaves the knowledge base unchanged.
+    ///
+    /// This is the whole definition of "changing": an operation that is not read-only is
+    /// withheld unless the server was started with `--persist`. Widening it would expose
+    /// operations, narrowing it would hide them.
     pub fn is_read_only(self) -> bool {
         self == Verb::Get
     }
@@ -45,13 +51,7 @@ impl Verb {
         self == Verb::Delete
     }
 
-    /// Whether an argument for it is conventionally carried in a request body rather than in the
-    /// query string. Read by the HTTP adapter and by the OpenAPI renderer; both must agree.
-    pub fn carries_a_body(self) -> bool {
-        matches!(self, Verb::Put | Verb::Post | Verb::Patch)
-    }
-
-    /// The lower-case name, which is also how OpenAPI keys a path item.
+    /// The lower-case name.
     pub fn as_str(self) -> &'static str {
         match self {
             Verb::Get => "get",
@@ -80,39 +80,179 @@ impl fmt::Display for Verb {
     }
 }
 
-/// One input or output argument, in the order the mode line declared it.
+/// Whether an argument is supplied by the caller or bound by the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    In,
+    Out,
+}
+
+/// How a generated goal invokes its predicate.
 ///
-/// Declaration order is preserved rather than hashed, so response keys, OpenAPI parameters and
-/// MCP schema properties all come out in a stable order. Iterating a `HashMap` here is what used
-/// to make JSON object key order vary from run to run.
+/// A collection's write routes are not plain calls, so keeping the three shapes here lets them
+/// share marshalling, escaping, the `catch/3` wrapper and answer shaping with everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalShape {
+    /// `p(A, B)` — ask the predicate.
+    Call,
+    /// `( p(A, B) -> true ; assertz(p(A, B)) )` — make it true, idempotently, as PUT promises.
+    Assert,
+    /// `retract(p(A, B))` — make it false, failing if it was not true, so that a DELETE of an
+    /// absent member can answer 404.
+    Retract,
+}
+
+/// Where an operation came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    /// A documented predicate, exposed under its own name.
+    Predicate,
+    /// Generated from a `@collection` declaration, and named after it. These are the only way
+    /// the predicate behind them is reachable.
+    Collection(String),
+}
+
+/// Where an argument's admissible values come from, once a `@domain` tag has been matched to the
+/// predicate that holds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Domain {
+    /// The predicate to ask.
+    pub predicate: String,
+    pub arity: usize,
+    /// Which of its arguments supplies the values.
+    pub position: usize,
+    /// Whether those facts can change while the server runs.
+    pub dynamic: bool,
+}
+
+impl Domain {
+    /// A goal collecting every value in this domain into `Values`.
+    pub fn goal(&self) -> String {
+        let arguments: Vec<&str> = (0..self.arity)
+            .map(|index| if index == self.position { "V" } else { "_" })
+            .collect();
+        let call = match self.arity {
+            0 => quote_atom(&self.predicate),
+            _ => format!("{}({})", quote_atom(&self.predicate), arguments.join(", ")),
+        };
+        // Wrapped like every other generated goal, so a domain predicate that throws cannot
+        // leave the machine unusable.
+        format!("catch(findall(V, {call}, Values), _, Values = []).")
+    }
+}
+
+/// A `@domain` tag, before and after the catalog matches it to a predicate.
+///
+/// Resolution needs the whole operation set — a tag may name a collection — so it happens one
+/// stage after the operations are built, and this records which stage a param has reached.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DomainState {
+    #[default]
+    None,
+    Declared(DomainSource),
+    Resolved(Domain),
+}
+
+/// One argument, in the order the mode line declared it.
+///
+/// Declaration order is what makes response keys, OpenAPI parameters and MCP schema properties
+/// come out the same way every time, so arguments live in a `Vec` and are never hashed.
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub declared_type: Type,
     pub description: Option<String>,
+    pub direction: Direction,
     /// The Prolog variable this argument becomes in a generated goal.
     pub variable: String,
-    /// The JSON Schema for this argument, resolved once when the operation was accepted. Holding
-    /// it here is what lets every descriptor be rendered without an `expect` for a case that
-    /// construction already ruled out.
-    schema: Value,
+    /// This argument's JSON Schema, settled when the operation was built.
+    pub schema: Value,
+    pub domain: DomainState,
 }
 
 impl Param {
-    pub fn schema(&self) -> &Value {
-        &self.schema
+    pub fn is_input(&self) -> bool {
+        self.direction == Direction::In
     }
+
+    /// The `@domain` tag as written, if it has not been resolved yet.
+    pub fn declared_domain(&self) -> Option<&DomainSource> {
+        match &self.domain {
+            DomainState::Declared(source) => Some(source),
+            _ => None,
+        }
+    }
+
+    /// The domain this argument ranges over, once resolved.
+    pub fn domain(&self) -> Option<&Domain> {
+        match &self.domain {
+            DomainState::Resolved(domain) => Some(domain),
+            _ => None,
+        }
+    }
+
+    /// Records the resolved domain and, when the values cannot change under the server's feet,
+    /// narrows the schema to exactly them.
+    ///
+    /// A `dynamic` domain is deliberately not baked in: descriptor documents are rendered once,
+    /// so an enum over facts that `assertz` can add to would go stale on the first write.
+    /// Completion still answers such a domain from the live machine.
+    pub(super) fn resolve_domain(&mut self, domain: Domain, values: Vec<Value>) {
+        if !domain.dynamic
+            && !values.is_empty()
+            && let Some(schema) = self.schema.as_object_mut()
+        {
+            schema.insert("enum".to_string(), Value::Array(values));
+        }
+        self.domain = DomainState::Resolved(domain);
+    }
+}
+
+/// The predicate a generated goal calls, and how it calls it.
+#[derive(Debug, Clone)]
+pub struct Goal {
+    predicate: String,
+    shape: GoalShape,
+    /// The variable `catch/3` binds a raised exception to, chosen not to collide with any
+    /// argument variable.
+    error_variable: String,
+}
+
+/// Where HTTP exposes an operation.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub verb: Verb,
+    /// The path, with any verb prefix stripped and no leading slash.
+    pub path: String,
+    /// Names of inputs carried in the URL path rather than the query string or a body. Empty
+    /// for everything but a collection's item routes.
+    pub in_path: Vec<String>,
+}
+
+/// The prose a descriptor quotes, flattened off the PlDoc comment.
+#[derive(Debug, Clone, Default)]
+pub struct Docs {
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    /// The PlDoc tags with no more specific home, already rendered as markdown lines.
+    pub tags: Vec<String>,
+    /// What `@throws`/`@error` promised this predicate can raise.
+    pub errors: Vec<String>,
+    pub deprecated: bool,
 }
 
 /// A documented predicate, exposed as something callable.
 #[derive(Debug, Clone)]
 pub struct Operation {
-    predicate: Predicate,
-    verb: Verb,
-    path: String,
-    inputs: Vec<Param>,
-    outputs: Vec<Param>,
-    error_variable: String,
+    name: String,
+    goal: Goal,
+    /// Every argument in declaration order, inputs and outputs interleaved as the mode line
+    /// wrote them. Building a goal and shaping an answer read this one list.
+    arguments: Vec<Param>,
+    determinism: Option<Determinism>,
+    docs: Docs,
+    route: Route,
+    origin: Origin,
 }
 
 impl TryFrom<Predicate> for Operation {
@@ -125,11 +265,8 @@ impl TryFrom<Predicate> for Operation {
             });
         }
 
-        let (verb, path) = parse_route(&predicate.name);
-
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-        for argument in predicate.arguments.iter() {
+        let mut arguments = Vec::with_capacity(predicate.arguments.len());
+        for argument in &predicate.arguments {
             let Some(schema) =
                 schema::for_type(&argument.param_type, argument.description.as_deref())
             else {
@@ -138,106 +275,215 @@ impl TryFrom<Predicate> for Operation {
                     declared: argument.param_type.to_string(),
                 });
             };
-
-            let param = Param {
-                name: argument.name.clone(),
-                declared_type: argument.param_type.clone(),
-                description: argument.description.clone(),
-                variable: marshal::variable_name(&argument.name),
-                schema,
-            };
-
-            match argument.mode {
-                Some(Mode::Input) => inputs.push(param),
-                Some(Mode::Output) => outputs.push(param),
+            let direction = match argument.mode {
+                Some(Mode::Input) => Direction::In,
+                Some(Mode::Output) => Direction::Out,
                 mode => {
                     return Err(UnsupportedPredicate::UnsupportedMode {
                         argument: argument.name.clone(),
                         mode: mode.map_or_else(|| "none".to_string(), |mode| mode.to_string()),
                     });
                 }
-            }
+            };
+
+            arguments.push(Param {
+                name: argument.name.clone(),
+                declared_type: argument.param_type.clone(),
+                description: argument.description.clone(),
+                direction,
+                variable: capitalise(&argument.name),
+                schema,
+                domain: predicate
+                    .doc
+                    .domains
+                    .iter()
+                    .find(|domain| domain.argument.eq_ignore_ascii_case(&argument.name))
+                    .map_or(DomainState::None, |domain| {
+                        DomainState::Declared(domain.source.clone())
+                    }),
+            });
         }
 
-        // Two arguments sharing a name would share a Prolog variable, quietly unifying values a
-        // caller passed separately.
-        if let Some(duplicate) = first_duplicate(inputs.iter().chain(&outputs).map(|p| &p.variable))
-        {
+        // Two arguments sharing a name would share one Prolog variable, quietly unifying values
+        // the caller passed separately.
+        if let Some(duplicate) = first_duplicate(arguments.iter().map(|param| &param.variable)) {
             return Err(UnsupportedPredicate::DuplicateArgument {
                 argument: duplicate,
             });
         }
 
-        let variables: Vec<String> = inputs
+        let variables: Vec<&str> = arguments
             .iter()
-            .chain(outputs.iter())
-            .map(|param| param.variable.clone())
+            .map(|param| param.variable.as_str())
             .collect();
+        let (verb, path) = parse_route(&predicate.name);
 
         Ok(Operation {
-            error_variable: marshal::error_variable(&variables),
-            predicate,
-            verb,
-            path,
-            inputs,
-            outputs,
+            goal: Goal {
+                predicate: predicate.name.clone(),
+                shape: GoalShape::Call,
+                error_variable: marshal::error_variable(&variables),
+            },
+            arguments,
+            determinism: predicate.determinism,
+            docs: Docs {
+                summary: predicate.doc.summary.clone(),
+                description: predicate.doc.description.clone(),
+                tags: predicate.doc.tag_lines(),
+                errors: predicate.doc.errors.clone(),
+                deprecated: predicate.doc.deprecated.is_some(),
+            },
+            route: Route {
+                verb,
+                path,
+                in_path: Vec::new(),
+            },
+            origin: Origin::Predicate,
+            name: predicate.name,
         })
     }
 }
 
 impl Operation {
-    /// The predicate's own name — the identity MCP exposes as a tool name.
+    /// The name this operation answers to: the predicate's own name, or the name a generated
+    /// collection route was given.
     pub fn name(&self) -> &str {
-        &self.predicate.name
+        &self.name
+    }
+
+    /// The predicate this operation calls, whatever it is exposed as.
+    pub fn predicate_name(&self) -> &str {
+        &self.goal.predicate
+    }
+
+    pub fn origin(&self) -> &Origin {
+        &self.origin
     }
 
     /// The path HTTP exposes it under, with any verb prefix stripped.
     pub fn path(&self) -> &str {
-        &self.path
+        &self.route.path
     }
 
     pub fn verb(&self) -> Verb {
-        self.verb
+        self.route.verb
+    }
+
+    /// Names of inputs taken from the URL path rather than the query string or a body.
+    pub fn path_parameters(&self) -> &[String] {
+        &self.route.in_path
+    }
+
+    pub fn docs(&self) -> &Docs {
+        &self.docs
+    }
+
+    /// Re-points a copy of this operation at a different route, goal shape and name, binding
+    /// `bound` arguments as inputs.
+    ///
+    /// This is how a collection's routes are derived from the predicate that enumerates it.
+    /// Flipping a direction changes neither an argument's schema nor its variable, so nothing
+    /// here has to be re-derived and no second construction path exists to drift from the first.
+    pub(super) fn bind(
+        &self,
+        name: String,
+        route: Route,
+        shape: GoalShape,
+        bound: &[String],
+    ) -> Self {
+        let mut derived = self.clone();
+        derived.name = name;
+        derived.goal.shape = shape;
+        derived.route = route;
+        for param in &mut derived.arguments {
+            param.direction = match bound.contains(&param.name) {
+                true => Direction::In,
+                false => Direction::Out,
+            };
+        }
+        derived
+    }
+
+    /// Marks this operation as generated for `collection`.
+    pub(super) fn owned_by(mut self, collection: &str) -> Self {
+        self.origin = Origin::Collection(collection.to_string());
+        self
+    }
+
+    /// Overrides the declared determinism. A generated item route is `semidet` however the
+    /// predicate that enumerates the collection was declared.
+    pub(super) fn with_determinism(mut self, determinism: Determinism) -> Self {
+        self.determinism = Some(determinism);
+        self
+    }
+
+    /// Whether calling this can change the knowledge base.
+    ///
+    /// Read off the verb, the only declaration of intent Charon has: `get_` promises a question,
+    /// every other prefix promises a change. Named here so the catalog, the descriptors and the
+    /// startup report cannot drift apart on what "changing" means.
+    pub fn is_mutating(&self) -> bool {
+        !self.route.verb.is_read_only()
     }
 
     pub fn determinism(&self) -> Option<Determinism> {
-        self.predicate.determinism
+        self.determinism
     }
 
-    pub fn inputs(&self) -> &[Param] {
-        &self.inputs
+    /// Every argument, in declaration order.
+    pub fn arguments(&self) -> &[Param] {
+        &self.arguments
     }
 
-    pub fn outputs(&self) -> &[Param] {
-        &self.outputs
+    pub(super) fn arguments_mut(&mut self) -> &mut [Param] {
+        &mut self.arguments
+    }
+
+    pub fn inputs(&self) -> impl Iterator<Item = &Param> {
+        self.arguments.iter().filter(|param| param.is_input())
+    }
+
+    pub fn outputs(&self) -> impl Iterator<Item = &Param> {
+        self.arguments.iter().filter(|param| !param.is_input())
+    }
+
+    /// The input called `name`, if this operation has one.
+    pub fn input(&self, name: &str) -> Option<&Param> {
+        self.inputs().find(|param| param.name == name)
     }
 
     pub fn is_deprecated(&self) -> bool {
-        self.predicate.doc.deprecated.is_some()
+        self.docs.deprecated
+    }
+
+    /// A short human name, for a client that renders a list of operations.
+    ///
+    /// Distinct from [`Operation::summary`], which is a sentence: a label slot showing a whole
+    /// sentence reads as noise in a tool picker.
+    pub fn title(&self) -> String {
+        capitalise(&self.name.replace('_', " "))
     }
 
     pub fn summary(&self) -> String {
-        self.predicate
-            .doc
+        self.docs
             .summary
             .clone()
-            .unwrap_or_else(|| format!("Call the `{}` predicate.", self.predicate.name))
+            .unwrap_or_else(|| format!("Call the `{}` predicate.", self.goal.predicate))
     }
 
-    /// The long-form description: the doc comment's later paragraphs, plus a rendered appendix
-    /// of the PlDoc tags that have no more specific home.
+    /// The long-form description: the doc comment's later paragraphs, then the determinism and
+    /// whatever PlDoc tags have no more specific home.
     pub fn description(&self) -> Option<String> {
-        let doc = &self.predicate.doc;
         let mut sections = Vec::new();
-        if let Some(description) = &doc.description {
+        if let Some(description) = &self.docs.description {
             sections.push(description.clone());
         }
 
         let mut meta = Vec::new();
-        if let Some(determinism) = self.predicate.determinism {
+        if let Some(determinism) = self.determinism {
             meta.push(format!("**Determinism:** {determinism}"));
         }
-        meta.extend(doc.tag_lines());
+        meta.extend(self.docs.tags.iter().cloned());
         if !meta.is_empty() {
             sections.push(meta.join("  \n"));
         }
@@ -247,131 +493,100 @@ impl Operation {
 
     /// Whether the declared determinism promises at most one solution.
     ///
-    /// This is the single fact the response shape turns on. Deciding it from the *declaration*
-    /// rather than from how many answers happened to come back is what makes the shape
-    /// predictable: a `nondet` predicate that found one solution is still an array, so a caller
-    /// can no longer confuse one solution binding `[1, 2]` with two solutions binding `1` and
-    /// `2` — which, when the answer decided the shape, were byte-identical.
+    /// This single fact decides the response shape, and it is read from the declaration rather
+    /// than from how many answers came back. That is what keeps the shape predictable: a
+    /// `nondet` predicate that found one solution is still an array, so one solution binding
+    /// `[1, 2]` cannot be confused with two solutions binding `1` and `2`.
     pub fn is_singular(&self) -> bool {
         matches!(
-            self.predicate.determinism,
+            self.determinism,
             Some(Determinism::Det | Determinism::Semidet)
         )
     }
 
     /// Whether the declared determinism allows the predicate to fail.
-    fn may_fail(&self) -> bool {
+    pub(super) fn may_fail(&self) -> bool {
         !matches!(
-            self.predicate.determinism,
+            self.determinism,
             Some(Determinism::Det | Determinism::Multi)
         )
     }
 
     /// The JSON Schema of this operation's arguments, as an object with every input required.
     pub fn input_schema(&self) -> Value {
-        schema::object(
-            self.inputs
-                .iter()
-                .map(|param| (param.name.clone(), param.schema.clone())),
-        )
-    }
-
-    /// The JSON Schema of a single solution.
-    ///
-    /// Zero outputs is just whether the query held; exactly one output is that value directly,
-    /// unwrapped; two or more is an object keyed by argument name.
-    pub fn solution_schema(&self) -> Value {
-        match self.outputs.as_slice() {
-            [] => json!({ "type": "boolean" }),
-            [only] => only.schema.clone(),
-            outputs => schema::object(
-                outputs
-                    .iter()
-                    .map(|param| (param.name.clone(), param.schema.clone())),
-            ),
-        }
+        schema::inputs_of(self)
     }
 
     /// The JSON Schema of a whole response.
-    ///
-    /// Exact, not a disjunction of every shape the runtime might reach: [`Self::is_singular`]
-    /// settles array-or-not before a single answer exists.
     pub fn response_schema(&self) -> Value {
-        let solution = self.solution_schema();
-        if self.is_singular() {
-            // A `semidet` predicate that fails answers `null`, or `false` when it has no outputs
-            // (in which case the boolean schema already covers it).
-            return if self.may_fail() && !self.outputs.is_empty() {
-                schema::nullable(solution)
-            } else {
-                solution
-            };
-        }
-
-        let (min, max) = self
-            .predicate
-            .determinism
-            .map_or((0, None), |determinism| determinism.solution_bounds());
-        schema::array(solution, Some(min), max)
+        schema::response_of(self)
     }
 
     /// Builds the Prolog goal for this operation, given its arguments as typed JSON.
     ///
-    /// The goal is wrapped in `catch/3`, so an exception in the knowledge base comes back as a
-    /// binding rather than escaping to the top level and poisoning the machine.
+    /// The goal is wrapped in `catch/3` so that an exception in the knowledge base comes back as
+    /// a binding rather than escaping to scryer's top level, where it would leave the machine
+    /// returning that same stale error for every later query.
     pub fn build_goal(&self, arguments: &Map<String, Value>) -> Result<String, ArgumentError> {
-        let mut terms = Vec::with_capacity(self.predicate.arguments.len());
-        for argument in self.predicate.arguments.iter() {
-            match argument.mode {
-                Some(Mode::Output) => terms.push(marshal::variable_name(&argument.name)),
-                _ => {
-                    let value =
-                        arguments
-                            .get(&argument.name)
-                            .ok_or_else(|| ArgumentError::Missing {
-                                argument: argument.name.clone(),
-                            })?;
-                    let term = marshal::term_for(value, &argument.param_type).map_err(|cause| {
-                        ArgumentError::Invalid {
-                            argument: argument.name.clone(),
-                            cause,
-                        }
-                    })?;
-                    terms.push(term);
-                }
+        let mut terms = Vec::with_capacity(self.arguments.len());
+        for param in &self.arguments {
+            if !param.is_input() {
+                terms.push(param.variable.clone());
+                continue;
             }
+            let value = arguments
+                .get(&param.name)
+                .ok_or_else(|| ArgumentError::Missing {
+                    argument: param.name.clone(),
+                })?;
+            terms.push(
+                marshal::term_for(value, &param.declared_type).map_err(|cause| {
+                    ArgumentError::Invalid {
+                        argument: param.name.clone(),
+                        cause,
+                    }
+                })?,
+            );
         }
 
-        let goal = if terms.is_empty() {
-            quote_atom(&self.predicate.name)
-        } else {
-            format!("{}({})", quote_atom(&self.predicate.name), terms.join(", "))
+        let predicate = quote_atom(&self.goal.predicate);
+        let call = match terms.is_empty() {
+            true => predicate,
+            false => format!("{predicate}({})", terms.join(", ")),
         };
-        Ok(marshal::wrap_goal(&goal, &self.error_variable))
+        let goal = match self.goal.shape {
+            GoalShape::Call => call,
+            // Idempotent by construction: adding a member that is already there succeeds and
+            // changes nothing, which is what PUT promises and what stops `--persist` writing a
+            // duplicate fact on every retry.
+            GoalShape::Assert => format!("( {call} -> true ; assertz({call}) )"),
+            GoalShape::Retract => format!("retract({call})"),
+        };
+        Ok(marshal::wrap_goal(&goal, &self.goal.error_variable))
     }
 
     /// The names of arguments this operation does not accept, out of the ones supplied.
     ///
-    /// A caller who misspells an argument otherwise gets "missing required argument `Drugs`"
-    /// while staring at the `Drug` they typed.
+    /// A caller who misspells an argument otherwise gets "missing required argument `Author`"
+    /// while staring at the `Auther` they typed.
     pub fn unexpected_arguments<'a>(
         &self,
         supplied: impl IntoIterator<Item = &'a String>,
     ) -> Vec<&'a String> {
         supplied
             .into_iter()
-            .filter(|name| !self.inputs.iter().any(|param| param.name == **name))
+            .filter(|name| !self.inputs().any(|param| param.name == **name))
             .collect()
     }
 
     /// Turns the answers to a generated goal into the response body.
     ///
     /// An answer that bound the error variable is the `catch/3` wrapper reporting an exception,
-    /// not a solution — it is returned as an error even though Prolog technically succeeded.
+    /// not a solution: it becomes an error even though Prolog technically succeeded.
     pub fn shape_answers(&self, answers: Vec<Answer>) -> Result<Value, PrologError> {
         let mut solutions = Vec::with_capacity(answers.len());
         for answer in answers {
-            if let Some(raised) = answer.binding(&self.error_variable)
+            if let Some(raised) = answer.binding(&self.goal.error_variable)
                 && !raised.is_null()
             {
                 return Err(PrologError::from_json(raised));
@@ -383,37 +598,41 @@ impl Operation {
             return Ok(Value::Array(solutions));
         }
         Ok(solutions.into_iter().next().unwrap_or({
-            // The declaration promised at most one solution and there was none. With no outputs
-            // the natural report is `false`; otherwise there is no value to give back.
-            match self.outputs.is_empty() {
-                true => Value::Bool(false),
-                false => Value::Null,
+            // At most one solution was promised and there was none. With no outputs the natural
+            // report is `false`; otherwise there is no value to give back.
+            match self.outputs().next().is_some() {
+                true => Value::Null,
+                false => Value::Bool(false),
             }
         }))
     }
 
+    /// One solution: nothing to bind is just whether the query held, a single output is that
+    /// value unwrapped, and several are an object keyed by argument name.
     fn shape_solution(&self, answer: &Answer) -> Value {
-        match self.outputs.as_slice() {
-            [] => Value::Bool(true),
-            [only] => answer
-                .binding(&only.variable)
-                .cloned()
-                .unwrap_or(Value::Null),
-            outputs => Value::Object(
-                outputs
-                    .iter()
-                    .map(|param| {
-                        (
-                            param.name.clone(),
-                            answer
-                                .binding(&param.variable)
-                                .cloned()
-                                .unwrap_or(Value::Null),
-                        )
-                    })
-                    .collect(),
-            ),
+        // Read the binding by the argument's declared type rather than only by the term's shape:
+        // `bool` is published as a JSON boolean and Prolog has only the atoms `true`/`false`.
+        let bound = |param: &Param| {
+            marshal::json_for(
+                answer
+                    .binding(&param.variable)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                &param.declared_type,
+            )
+        };
+        let mut outputs = self.outputs();
+        let Some(first) = outputs.next() else {
+            return Value::Bool(true);
+        };
+        if outputs.next().is_none() {
+            return bound(first);
         }
+        Value::Object(
+            self.outputs()
+                .map(|param| (param.name.clone(), bound(param)))
+                .collect(),
+        )
     }
 }
 
@@ -427,6 +646,16 @@ fn parse_route(name: &str) -> (Verb, String) {
         }
     }
     (Verb::Get, name.to_string())
+}
+
+/// `len` → `Len`. Prolog variables must start with an upper-case letter or underscore, and PlDoc
+/// argument names need not; the same rule gives an operation its display title.
+pub(super) fn capitalise(text: &str) -> String {
+    let mut characters = text.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
 }
 
 fn first_duplicate<'a>(values: impl IntoIterator<Item = &'a String>) -> Option<String> {
@@ -506,6 +735,7 @@ impl fmt::Display for ArgumentError {
 mod tests {
     use super::*;
     use crate::prolog::Predicate;
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     /// Builds the one operation documented by `source`.
@@ -540,10 +770,23 @@ mod tests {
         );
         // No prefix at all reads as a plain lookup.
         assert_eq!(parse_route("fruit"), (Verb::Get, "fruit".to_string()));
-        // A bare prefix is a name, not a prefix: `get_` would otherwise route to the empty path.
+        // A bare prefix is treated as a name: `get_` would otherwise route to the empty path.
         assert_eq!(parse_route("get_"), (Verb::Get, "get_".to_string()));
         // Only the documented prefixes count; `getter` keeps its name.
         assert_eq!(parse_route("getter"), (Verb::Get, "getter".to_string()));
+    }
+
+    #[test]
+    fn arguments_keep_declaration_order_whatever_their_direction() {
+        let operation = operation("%! f(-A:int, +B:int, -C:int) is det.\nf(_, _, _).\n");
+        let names: Vec<&str> = operation
+            .arguments()
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect();
+        assert_eq!(names, ["A", "B", "C"]);
+        assert_eq!(operation.inputs().count(), 1);
+        assert_eq!(operation.outputs().count(), 2);
     }
 
     #[test]
@@ -553,9 +796,6 @@ mod tests {
         let answer = vec![bindings(&[("X", json!(1))])];
 
         assert_eq!(singular.shape_answers(answer.clone()).unwrap(), json!(1));
-        // One solution, but the declaration allows more, so it stays an array. This is the
-        // ambiguity the old count-based unwrap had: a single `list` solution and several scalar
-        // solutions produced exactly the same JSON.
         assert_eq!(plural.shape_answers(answer).unwrap(), json!([1]));
     }
 
@@ -596,39 +836,6 @@ mod tests {
             .shape_answers(vec![bindings(&[("Zeta", json!(1)), ("Alpha", json!(2))])])
             .unwrap();
         assert_eq!(shaped.to_string(), r#"{"Zeta":1,"Alpha":2}"#);
-    }
-
-    #[test]
-    fn the_response_schema_is_exact_rather_than_a_disjunction() {
-        let det = operation("%! len(+L:list, -N:int) is det.\nlen(_, 0).\n");
-        assert_eq!(det.response_schema(), json!({ "type": "integer" }));
-
-        let multi = operation("%! colour(-C:atom) is multi.\ncolour(red).\n");
-        assert_eq!(
-            multi.response_schema(),
-            json!({ "type": "array", "items": { "type": "string" }, "minItems": 1 })
-        );
-
-        let failure = operation("%! never(-X:int) is failure.\nnever(_) :- fail.\n");
-        assert_eq!(failure.response_schema()["maxItems"], json!(0));
-    }
-
-    #[test]
-    fn a_semidet_predicate_documents_the_null_it_can_answer_with() {
-        let semidet = operation("%! maybe(-X:int) is semidet.\nmaybe(1).\n");
-        let alternatives = semidet.response_schema()["oneOf"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert!(alternatives.contains(&json!({ "type": "integer" })));
-        assert!(alternatives.contains(&json!({ "type": "null" })));
-    }
-
-    #[test]
-    fn an_undeclared_determinism_is_treated_as_unbounded() {
-        let operation = operation("%! anything(-X:int).\nanything(1).\n");
-        assert!(!operation.is_singular());
-        assert_eq!(operation.response_schema()["type"], "array");
     }
 
     #[test]
@@ -713,12 +920,26 @@ mod tests {
     }
 
     #[test]
+    fn every_verb_but_get_is_a_change() {
+        // The gate `--persist` opens. `post_` counts: a POST is not safe in HTTP terms, and a
+        // knowledge base that spells `post_event(X) :- assertz(...)` must not slip through.
+        assert!(!operation("%! get_x(-X:int) is det.\nget_x(1).\n").is_mutating());
+        assert!(!operation("%! x(-X:int) is det.\nx(1).\n").is_mutating());
+        for source in [
+            "%! put_x(+X:int) is det.\nput_x(_).\n",
+            "%! post_x(+X:int) is det.\npost_x(_).\n",
+            "%! patch_x(+X:int) is det.\npatch_x(_).\n",
+            "%! delete_x(+X:int) is det.\ndelete_x(_).\n",
+        ] {
+            assert!(operation(source).is_mutating(), "{source}");
+        }
+    }
+
+    #[test]
     fn verb_hints_follow_http_semantics() {
         assert!(Verb::Get.is_read_only() && Verb::Get.is_idempotent());
         assert!(!Verb::Post.is_idempotent());
         assert!(Verb::Put.is_idempotent() && !Verb::Put.is_destructive());
         assert!(Verb::Delete.is_destructive() && Verb::Delete.is_idempotent());
-        assert!(!Verb::Get.carries_a_body() && !Verb::Delete.carries_a_body());
-        assert!(Verb::Post.carries_a_body() && Verb::Patch.carries_a_body());
     }
 }

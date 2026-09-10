@@ -13,5 +13,8 @@ mod term;
 pub use self::interpreter::{Answer, Interpreter, PrologError};
 pub use self::knowledge_base::{Error, KnowledgeBase};
 pub use self::persistence::DynamicPredicate;
-pub use self::predicate::{Argument, Determinism, Doc, Mode, ModuleDoc, Predicate, Type};
+pub use self::predicate::{
+    Argument, CollectionTag, Determinism, Doc, DomainSource, DomainTag, Mode, ModuleDoc, Predicate,
+    Type,
+};
 pub use self::term::{quote_atom, quote_string};

@@ -6,33 +6,12 @@
 mod common;
 
 use std::fs;
-use std::path::PathBuf;
 
+use axum::http::StatusCode;
 use charon::prolog::KnowledgeBase;
 use charon::service::{CatalogError, Config, Service, StartupError};
-use common::{fixture, http_server};
+use common::{Persisting, Scratch, fixture, http_server};
 use serde_json::{Value, json};
-
-/// A scratch `.pl` file that removes itself.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str, source: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("charon_{name}_{}.pl", std::process::id()));
-        fs::write(&path, source).unwrap();
-        Scratch(path)
-    }
-
-    fn rewrite(&self, source: &str) {
-        fs::write(&self.0, source).unwrap();
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 
 const GREETING: &str = "%! greeting(-Text:atom) is det.\n%\n%   A greeting.\n%\n%   @arg Text The greeting.\ngreeting(hello).\n";
 
@@ -41,21 +20,59 @@ const GREETING: &str = "%! greeting(-Text:atom) is det.\n%\n%   A greeting.\n%\n
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn broken_clause_fails_startup_and_names_the_missing_predicate() {
+fn a_broken_clause_fails_startup_rather_than_binding_a_port() {
     // `broken.pl` contains one clause whose arithmetic cannot be evaluated. That aborts scryer's
     // whole consult, so even `healthy/1` — a plain fact declared above it — is left undefined.
     // Charon used to start and bind regardless, then answer every request with an existence
-    // error; startup must fail instead, naming what went missing.
+    // error; startup must fail instead.
     let error = Service::open(fixture("broken.pl"), Config::default())
         .expect_err("a knowledge base whose consult failed must not start");
 
-    let StartupError::Catalog(CatalogError::PredicatesMissing(missing)) = error else {
-        panic!("expected a missing-predicate failure, got {error:?}");
-    };
     assert!(
-        missing.iter().any(|indicator| indicator == "healthy/1"),
-        "expected healthy/1 to be reported missing, got {missing:?}"
+        matches!(
+            error,
+            StartupError::Catalog(CatalogError::ConsultFailed)
+                | StartupError::Catalog(CatalogError::PredicatesMissing(_))
+        ),
+        "expected a load failure, got {error:?}"
     );
+    assert!(
+        error.to_string().contains("did not load completely"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_broken_clause_is_caught_even_where_probing_the_predicates_cannot_see_it() {
+    // The blind spot behind the sentinel: the bad clause belongs to `colour/1`, which already has
+    // a good clause, so `current_predicate(colour/1)` answers true and every per-predicate probe
+    // passes. Found by editing a served knowledge base and reloading it — the server accepted the
+    // edit and then answered `existence_error` to everything.
+    let scratch = Scratch::new(
+        "blind_spot",
+        "%! colour(-C:atom) is multi.\ncolour(red).\ncolour(X) :- X is bogus + 1.\n",
+    );
+
+    let error = Service::open(&scratch.0, Config::default())
+        .expect_err("an aborted consult must not start, however it aborted");
+    assert!(
+        matches!(error, StartupError::Catalog(CatalogError::ConsultFailed)),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn a_reload_that_cannot_compile_leaves_the_previous_version_serving() {
+    // The promise `SIGHUP` reloading depends on: a half-saved file must be an inconvenience, not
+    // an outage.
+    let scratch = Scratch::new("reload_broken", GREETING);
+    let service = Service::open(&scratch.0, Config::default()).expect("should start");
+
+    scratch.rewrite(&format!("{GREETING}broken(X) :- X is bogus + 1.\n"));
+    assert!(service.reload().is_err());
+
+    // Still answering, and still from the version that compiled.
+    assert!(service.catalog().find("greeting").is_some());
 }
 
 #[test]
@@ -77,9 +94,11 @@ async fn exception_does_not_poison_later_requests() {
     server.get("/ready").await.assert_status_ok();
 
     let raised = server.get("/raises").add_query_param("X", "1").await;
-    raised.assert_status_bad_request();
+    // A term the knowledge base threw on purpose is about this request, not a defect in the
+    // file, so it is a 422 rather than a 500.
+    raised.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     assert!(
-        raised.json::<Value>()["error"]
+        raised.json::<Value>()["detail"]
             .as_str()
             .unwrap()
             .contains("deliberate_test_error"),
@@ -109,7 +128,7 @@ async fn repeated_exceptions_stay_contained() {
             .get("/raises")
             .add_query_param("X", "1")
             .await
-            .assert_status_bad_request();
+            .assert_status(StatusCode::UNPROCESSABLE_ENTITY);
         server.get("/ready").await.assert_status_ok();
     }
 }
@@ -119,7 +138,7 @@ async fn prolog_errors_are_rendered_in_prolog_syntax() {
     let server = http_server("api_test.pl");
 
     let response = server.get("/raises").add_query_param("X", "1").await;
-    let message = response.json::<Value>()["error"]
+    let message = response.json::<Value>()["detail"]
         .as_str()
         .unwrap()
         .to_string();
@@ -238,7 +257,10 @@ async fn list_of_atoms_unifies_with_plain_atom_facts() {
 
 #[tokio::test]
 async fn scalar_atom_matches_the_same_facts_as_a_list_element() {
-    let server = http_server("api_test.pl");
+    // Asserting needs a writable server: `put_fruit` changes the knowledge base, so a read-only
+    // process withholds it entirely.
+    let writable = common::writable_http("regress_scalar_atom");
+    let server = &*writable;
 
     server
         .put("/fruit")
@@ -360,7 +382,7 @@ fn reload_picks_up_an_edited_file_and_rebuilds_the_cached_descriptors() {
     let before = service.catalog();
     assert!(before.find("greeting").is_some());
     assert!(before.find("farewell").is_none());
-    let etag_before = before.etag().to_string();
+    let revision_before = before.revision();
 
     scratch.rewrite(&format!(
         "{GREETING}\n%! farewell(-Text:atom) is det.\n%\n%   A farewell.\n%\n%   @arg Text The farewell.\nfarewell(bye).\n"
@@ -369,10 +391,10 @@ fn reload_picks_up_an_edited_file_and_rebuilds_the_cached_descriptors() {
 
     let after = service.catalog();
     assert!(after.find("farewell").is_some(), "new predicate visible");
-    // The cached descriptors are rebuilt, not stale.
-    assert_ne!(after.etag(), etag_before);
-    assert!(after.openapi_json().contains("/farewell"));
-    assert!(after.tools_json().contains("farewell"));
+    // The revision moved on, which is what makes each adapter re-render its descriptors.
+    assert_ne!(after.revision(), revision_before);
+    assert!(charon::http::openapi::document(&after).contains("/farewell"));
+    assert!(charon::mcp::tools(&after).to_string().contains("farewell"));
 }
 
 #[test]
@@ -468,4 +490,237 @@ fn a_predicate_that_cannot_be_exposed_is_reported_rather_than_missing() {
         .expect("`hidden` has a `?` mode, which cannot be exposed");
     assert_eq!(name, "hidden");
     assert!(reason.to_string().contains('?'), "{reason}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Changing operations are exposed only when the server can write the change down.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_withheld_operation_is_refused_rather_than_run() {
+    // The defect this pins: without `--persist`, `PUT /fruit` used to *succeed* — the `assertz`
+    // committed to the running machine and nobody wrote it down, so the server quietly diverged
+    // from the file it claims to serve until the next restart threw the change away.
+    let server = http_server("api_test.pl");
+
+    let refused = server
+        .put("/fruit")
+        .json(&json!({ "Fruit": "banana" }))
+        .await;
+    refused.assert_status(StatusCode::FORBIDDEN);
+
+    let body: Value = refused.json();
+    assert_eq!(body["type"], "urn:charon:withheld");
+    assert!(
+        body["detail"].as_str().unwrap().contains("--persist"),
+        "the refusal must say what to change: {body}"
+    );
+
+    // And, the point of the whole exercise, nothing happened.
+    server.get("/fruit").await.assert_json(&json!(["apple"]));
+}
+
+#[tokio::test]
+async fn mutating_operations_are_absent_from_the_openapi_document_without_persistence() {
+    let server = http_server("api_test.pl");
+    let document: Value = server.get("/openapi.json").await.json();
+
+    let fruit = &document["paths"]["/fruit"];
+    assert!(fruit["get"].is_object(), "reading is always on offer");
+    assert!(fruit.get("put").is_none(), "{fruit}");
+    assert!(fruit.get("delete").is_none(), "{fruit}");
+    // `post_note` has no read-only counterpart, so its path disappears entirely.
+    assert!(document["paths"].get("/note").is_none());
+}
+
+#[tokio::test]
+async fn mutating_tools_are_absent_from_the_tool_list_without_persistence() {
+    let server = common::mcp_server("api_test.pl");
+    let response = server
+        .post("/mcp")
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await;
+
+    let listed: Value = response.json();
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+
+    assert!(names.contains(&"get_fruit"));
+    for withheld in ["put_fruit", "delete_fruit", "post_note"] {
+        assert!(!names.contains(&withheld), "{withheld} should be withheld");
+    }
+}
+
+#[tokio::test]
+async fn a_withheld_tool_says_why_rather_than_looking_broken() {
+    // A model that is told "restart with --persist" can relay that to a person. A bare
+    // `-32602 unknown tool` just looks like a server that does not work.
+    let server = common::mcp_server("api_test.pl");
+    let response: Value = server
+        .post("/mcp")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "put_fruit", "arguments": { "Fruit": "banana" } },
+        }))
+        .await
+        .json();
+
+    let result = &response["result"];
+    assert_eq!(result["isError"], true, "{response}");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("--persist"), "{text}");
+}
+
+#[tokio::test]
+async fn the_allow_header_never_advertises_a_method_that_would_be_refused() {
+    // `/fruit` answers PUT and DELETE on a writable server. On a read-only one it answers only
+    // GET, and saying otherwise would send a caller straight into a second failure.
+    let server = http_server("api_test.pl");
+    let response = server.post("/fruit").await;
+
+    response.assert_status(StatusCode::METHOD_NOT_ALLOWED);
+    let allow = response.headers()["allow"].to_str().unwrap().to_string();
+    assert_eq!(allow, "GET, HEAD", "{allow}");
+}
+
+#[test]
+fn persistence_decides_what_is_reachable_never_whether_the_file_is_valid() {
+    // Two changing predicates answering to one name is a startup failure. It must be one
+    // *whether or not* `--persist` was passed: a flag that decides what is reachable must never
+    // be able to turn a server that starts into one that refuses to, or adding the flag later
+    // would surface a failure the author never saw.
+    let scratch = Scratch::new(
+        "collide_mutating",
+        "%! put_fruit(+F:atom) is det.\nput_fruit(_).\n\n\
+         %! put_fruit(+G:atom) is det.\nput_fruit(_).\n",
+    );
+
+    for config in [Config::default(), Config::persisting(true)] {
+        let persist = config.persist;
+        let error = Service::open(&scratch.0, config)
+            .expect_err("a duplicate name is a startup failure either way");
+        assert!(
+            matches!(error, StartupError::Catalog(CatalogError::DuplicateName(_))),
+            "with persist={persist}: {error:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// An endless relation is capped rather than allowed to exhaust the process.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_endless_relation_is_capped_and_says_so() {
+    // Before the cap, `GET /endless` collected solutions into a `Vec` until the process died,
+    // holding the machine's lock throughout — so one such request took every other request with
+    // it, on both interfaces.
+    let persisting = Persisting::source(
+        "endless_cap",
+        "%! endless(-N:int) is nondet.\nendless(0).\nendless(N) :- endless(M), N is M + 1.\n",
+    );
+    let service = std::sync::Arc::new(
+        Service::open(
+            &persisting.scratch.0,
+            Config {
+                max_solutions: Some(5),
+                ..Config::default()
+            },
+        )
+        .expect("should start"),
+    );
+    let server = axum_test::TestServer::new(charon::http::routes(std::sync::Arc::clone(&service)));
+
+    let response = server.get("/endless").await;
+    response.assert_status_ok();
+    assert_eq!(response.json::<Value>(), json!([0, 1, 2, 3, 4]));
+    assert_eq!(
+        response.headers()["x-charon-truncated"].to_str().unwrap(),
+        "true",
+        "a capped answer must not look like a complete one"
+    );
+
+    // And the machine survived being cut off, which is the part that is not obvious.
+    let again = server.get("/endless").await;
+    again.assert_status_ok();
+    assert_eq!(again.json::<Value>(), json!([0, 1, 2, 3, 4]));
+}
+
+#[tokio::test]
+async fn a_complete_answer_is_not_labelled_truncated() {
+    let server = http_server("api_test.pl");
+    let response = server.get("/color").await;
+
+    response.assert_status_ok();
+    assert!(
+        response.headers().get("x-charon-truncated").is_none(),
+        "three colours under a cap of 1000 is the whole answer"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// D8 — a `bool` output is answered as a boolean, because that is what its schema promises.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_bool_output_answers_with_a_json_boolean_and_not_the_word() {
+    let server = http_server("api_test.pl");
+
+    // Prolog has no boolean type: `true` and `false` are ordinary atoms, and reading an answer
+    // by the term's own shape turned both into JSON *strings*. The published schema for the
+    // same argument said `"type": "boolean"` all along, so Charon was generating responses that
+    // failed validation against its own description of itself — and a client that branched on
+    // the value got a truthy string either way.
+    let document: Value = server.get("/openapi.json").await.json();
+    let schema = &document["paths"]["/is_even"]["get"]["responses"]["200"]["content"]
+        ["application/json"]["schema"];
+    assert_eq!(schema["type"], "boolean", "the document promises a boolean");
+
+    let even: Value = server
+        .get("/is_even")
+        .add_query_param("Value", "4")
+        .await
+        .json();
+    assert_eq!(even, json!(true), "and the answer must be one");
+
+    let odd: Value = server
+        .get("/is_even")
+        .add_query_param("Value", "7")
+        .await
+        .json();
+    assert_eq!(odd, json!(false));
+
+    // Alongside another output the solution is an object, so the conversion has to reach into
+    // it rather than only handle the unwrapped case. `Sign` is an atom and stays a string.
+    let classified: Value = server
+        .get("/classify")
+        .add_query_param("Value", "-4")
+        .await
+        .json();
+    assert_eq!(classified, json!({"Even": true, "Sign": "negative"}));
+
+    // And it recurses through `list(bool)`, the way argument marshalling does on the way in.
+    let parities: Value = server
+        .get("/parities")
+        .add_query_param("Values", "[1,2,3,4]")
+        .await
+        .json();
+    assert_eq!(parities, json!([false, true, false, true]));
+}
+
+#[tokio::test]
+async fn a_bool_output_bound_to_something_else_is_left_alone() {
+    let server = http_server("api_test.pl");
+
+    // `undecided/1` is declared `bool` and binds `maybe`. That is a defect in the knowledge
+    // base, and the repair above must not paper over it by picking a boolean: the value comes
+    // back as it was so that the mismatch stays visible to whoever wrote the mode line.
+    let answer: Value = server.get("/undecided").await.json();
+    assert_eq!(answer, json!("maybe"));
 }

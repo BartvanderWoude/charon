@@ -128,7 +128,10 @@ async fn query_parameters_are_read_as_their_declared_type() {
 
 #[tokio::test]
 async fn a_json_body_carries_already_typed_arguments() {
-    let server = http_server("api_test.pl");
+    // `post_note` changes nothing, but a `post_` prefix declares intent to change, so a
+    // read-only server withholds it. This test is about transport, so give it a writable one.
+    let writable = common::writable_http("http_json_body");
+    let server = &*writable;
 
     // A `post_` predicate documents a request body, and sending one has to work without
     // url-encoding every argument into the query string first.
@@ -140,7 +143,8 @@ async fn a_json_body_carries_already_typed_arguments() {
 
 #[tokio::test]
 async fn query_parameters_still_work_for_a_body_carrying_method() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_body_query");
+    let server = &*writable;
 
     // Documenting a body for POST should not make `curl -X POST '...?Text=hello'` stop working.
     let response = server.post("/note").add_query_param("Text", "hello").await;
@@ -151,7 +155,8 @@ async fn query_parameters_still_work_for_a_body_carrying_method() {
 
 #[tokio::test]
 async fn an_argument_given_twice_is_refused_rather_than_silently_preferred() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_twice");
+    let server = &*writable;
 
     let response = server
         .post("/note")
@@ -162,14 +167,15 @@ async fn an_argument_given_twice_is_refused_rather_than_silently_preferred() {
     response.assert_status_bad_request();
     let body: Value = response.json();
     assert!(
-        body["error"].as_str().unwrap().contains("Text"),
+        body["detail"].as_str().unwrap().contains("Text"),
         "got {body}"
     );
 }
 
 #[tokio::test]
 async fn a_body_that_is_not_a_json_object_is_refused() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_bad_body");
+    let server = &*writable;
 
     let response = server.post("/note").json(&json!(["hello"])).await;
     response.assert_status_bad_request();
@@ -188,10 +194,14 @@ async fn a_missing_argument_is_named() {
 
     let response = server.get("/list_length").await;
 
-    response.assert_status_bad_request();
+    // A well-formed request whose content the rules cannot act on is a 422; 400 is for a
+    // request that could not be read at all.
+    response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
     let body: Value = response.json();
+    assert_eq!(body["type"], "urn:charon:argument-missing");
+    assert_eq!(body["argument"], "List");
     assert!(
-        body["error"].as_str().unwrap().contains("List"),
+        body["detail"].as_str().unwrap().contains("List"),
         "got {body}"
     );
 }
@@ -207,11 +217,10 @@ async fn a_misspelled_argument_is_named_instead_of_ignored() {
         .add_query_param("Value", "[1,2]")
         .await;
 
-    response.assert_status_bad_request();
-    let message = response.json::<Value>()["error"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = response.json();
+    assert_eq!(body["type"], "urn:charon:argument-unexpected");
+    let message = body["detail"].as_str().unwrap().to_string();
     assert!(message.contains("Value"), "got {message}");
 }
 
@@ -224,11 +233,10 @@ async fn an_ill_typed_argument_is_named() {
         .add_query_param("Values", "[\"not\",\"numbers\"]")
         .await;
 
-    response.assert_status_bad_request();
-    let message = response.json::<Value>()["error"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = response.json();
+    assert_eq!(body["type"], "urn:charon:argument-invalid");
+    let message = body["detail"].as_str().unwrap().to_string();
     assert!(message.contains("Values"), "got {message}");
 }
 
@@ -238,7 +246,8 @@ async fn an_ill_typed_argument_is_named() {
 
 #[tokio::test]
 async fn verb_prefixed_predicates_share_one_path() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_verbs");
+    let server = &*writable;
 
     // `get_fruit`/`put_fruit`/`delete_fruit` all collapse onto `/fruit`, dispatched by method.
     server.get("/fruit").await.assert_json(&json!(["apple"]));
@@ -268,12 +277,13 @@ async fn an_unknown_path_is_not_found() {
     let response = server.get("/does_not_exist").await;
 
     response.assert_status_not_found();
-    assert!(response.json::<Value>()["error"].is_string());
+    assert!(response.json::<Value>()["detail"].is_string());
 }
 
 #[tokio::test]
 async fn a_path_that_does_not_answer_this_method_says_which_it_does() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_wrong_verb");
+    let server = &*writable;
 
     // `/fruit` exists for GET, PUT and DELETE, but not for POST. "Not found" would send a
     // caller looking for a typo that is not there.
@@ -316,7 +326,8 @@ async fn openapi_info_comes_from_the_module_comment() {
 
 #[tokio::test]
 async fn openapi_documents_arguments_where_the_method_carries_them() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_openapi_body");
+    let server = &*writable;
     let document: Value = server.get("/openapi.json").await.json();
 
     // GET takes its arguments in the query string…
@@ -388,7 +399,8 @@ async fn openapi_marks_deprecated_predicates() {
 
 #[tokio::test]
 async fn openapi_documents_verb_prefixed_predicates_under_one_path() {
-    let server = http_server("api_test.pl");
+    let writable = common::writable_http("http_openapi_verbs");
+    let server = &*writable;
     let document: Value = server.get("/openapi.json").await.json();
 
     let path = &document["paths"]["/fruit"];

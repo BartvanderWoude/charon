@@ -38,10 +38,10 @@ impl fmt::Display for Mode {
 /// The declared type of a predicate argument.
 ///
 /// The distinction between `Atom` and `String` is what removes the need for knowledge bases to
-/// normalise names by hand: a JSON string becomes a Prolog atom (`'diazepam'`) or a Prolog
-/// string (`"diazepam"`) according to what was declared, rather than according to whether it
-/// arrived as a scalar or inside a list. `List` carries its element type for the same reason —
-/// `list(atom)` is what makes `["diazepam"]` unify with an ordinary `pim(diazepam, …)` fact.
+/// normalise names by hand: a JSON string becomes a Prolog atom (`'aspirin'`) or a Prolog string
+/// (`"aspirin"`) according to what was declared, rather than according to whether it arrived as a
+/// scalar or inside a list. `List` carries its element type for the same reason — `list(atom)` is
+/// what makes `["aspirin"]` unify with an ordinary `drug(aspirin, …)` fact.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Type {
     Any,
@@ -179,6 +179,40 @@ pub struct Argument {
     pub description: Option<String>,
 }
 
+/// A `@collection <name> key(<Arg>, ...)` tag.
+///
+/// Declares that an enumerating predicate is a *table* rather than an operation, and names the
+/// arguments that identify a row. Charon derives the item routes and the MCP resources from it,
+/// so one line turns `book(-Title)` into a collection addressable per member on both interfaces.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct CollectionTag {
+    /// What to call the collection, e.g. `books`.
+    pub name: String,
+    /// The argument names that identify one row, in the order they appear in a path.
+    pub key: Vec<String>,
+}
+
+/// A `@domain <Argument> <source>` tag: where an argument's admissible values come from.
+///
+/// The source is either a collection's name or a `name/arity` predicate indicator. This is what
+/// lets Charon answer MCP argument completion from the knowledge base itself, and what turns a
+/// bounded domain into a JSON Schema `enum` on both interfaces.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct DomainTag {
+    /// The argument whose values are constrained.
+    pub argument: String,
+    /// The source of the values.
+    pub source: DomainSource,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum DomainSource {
+    /// A collection declared elsewhere with `@collection`; its key supplies the values.
+    Collection(String),
+    /// A predicate, whose first argument supplies the values.
+    Predicate { name: String, arity: usize },
+}
+
 /// Predicate-level documentation gathered from the free text and tags following a `%!` mode
 /// line. See <https://www.swi-prolog.org/pldoc/man?section=tags> for the tag reference.
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
@@ -207,6 +241,10 @@ pub struct Doc {
     pub tbd: Vec<String>,
     /// `@error`/`@throws` entries.
     pub errors: Vec<String>,
+    /// The `@collection` tag, if this predicate declares itself a table.
+    pub collection: Option<CollectionTag>,
+    /// `@domain` tags, one per constrained argument.
+    pub domains: Vec<DomainTag>,
 }
 
 impl Doc {
@@ -285,6 +323,62 @@ struct Signature {
     name: String,
     arguments: Vec<Argument>,
     determinism: Option<Determinism>,
+}
+
+/// Parses a `@collection` tag's content: `books key(Title)`.
+///
+/// Hand-written for the same reason [`parse_mode_line`] is: `key\(([^)]*)\)` stops at the first
+/// closing parenthesis the moment a key argument nests, and the failure mode of a regex here is
+/// a silently mangled key rather than an error.
+fn parse_collection_tag(content: &str) -> Option<CollectionTag> {
+    let content = content.trim();
+    let name_end = content
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(content.len());
+    let (name, rest) = content.split_at(name_end);
+    if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return None;
+    }
+
+    let rest = rest.trim_start();
+    let after_open = rest.strip_prefix("key(")?;
+    let close = matching_paren(after_open)?;
+    if !after_open[close + 1..].trim().is_empty() {
+        return None;
+    }
+
+    let key: Vec<String> = after_open[..close]
+        .split(',')
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect();
+    // A collection with no key has no addressable members, which is the whole point of one.
+    (!key.is_empty()).then_some(CollectionTag {
+        name: name.to_string(),
+        key,
+    })
+}
+
+/// Parses a `@domain` tag's content: `Title books`, or `Title book/1`.
+fn parse_domain_tag(content: &str) -> Option<DomainTag> {
+    let (argument, source) = content.trim().split_once(char::is_whitespace)?;
+    let argument = argument.trim();
+    let source = source.trim();
+    if argument.is_empty() || source.is_empty() {
+        return None;
+    }
+
+    let source = match source.split_once('/') {
+        Some((name, arity)) => DomainSource::Predicate {
+            name: name.trim().to_string(),
+            arity: arity.trim().parse().ok()?,
+        },
+        None => DomainSource::Collection(source.to_string()),
+    };
+    Some(DomainTag {
+        argument: argument.to_string(),
+        source,
+    })
 }
 
 /// Parses a PlDoc mode line: `%! name(+In:type, -Out:list(atom)) is det.`
@@ -531,6 +625,23 @@ impl Predicate {
                 "bug" if !content.is_empty() => doc.bugs.push(content),
                 "tbd" if !content.is_empty() => doc.tbd.push(content),
                 "error" | "throws" if !content.is_empty() => doc.errors.push(content),
+                "collection" => match parse_collection_tag(&content) {
+                    Some(collection) => doc.collection = Some(collection),
+                    // Reported rather than silently dropped: a malformed tag that quietly does
+                    // nothing is the same mystery as a missing endpoint.
+                    None => tracing::warn!(
+                        tag = %content,
+                        "ignoring a malformed @collection tag; expected `name key(Arg, ...)`"
+                    ),
+                },
+                "domain" => match parse_domain_tag(&content) {
+                    Some(domain) => doc.domains.push(domain),
+                    None => tracing::warn!(
+                        tag = %content,
+                        "ignoring a malformed @domain tag; expected `Argument collection` or \
+                         `Argument name/arity`"
+                    ),
+                },
                 _ => {}
             }
         }
@@ -969,5 +1080,69 @@ role(member).
     #[test]
     fn test_doc_render_empty_doc_is_none() {
         assert_eq!(Doc::default().render(), None);
+    }
+
+    #[test]
+    fn a_collection_tag_names_a_table_and_its_key() {
+        let source = "%! consent_module(-Module:atom) is multi.
+%
+%   The consent modules.
+%
+%   @collection consent_modules key(Module)
+%   @arg Module The module's short name.
+consent_module(research).
+";
+        let predicates = Predicate::parse(source);
+        let collection = predicates[0]
+            .doc
+            .collection
+            .as_ref()
+            .expect("the tag should be parsed");
+        assert_eq!(collection.name, "consent_modules");
+        assert_eq!(collection.key, vec!["Module".to_string()]);
+    }
+
+    #[test]
+    fn a_collection_key_may_have_several_columns() {
+        assert_eq!(
+            parse_collection_tag("criteria key(Substance, Kind)"),
+            Some(CollectionTag {
+                name: "criteria".to_string(),
+                key: vec!["Substance".to_string(), "Kind".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_collection_tag_is_rejected_rather_than_half_read() {
+        // A half-read key would address the wrong member, which is worse than no collection.
+        assert_eq!(parse_collection_tag("criteria"), None);
+        assert_eq!(parse_collection_tag("criteria key()"), None);
+        assert_eq!(parse_collection_tag("criteria key(Substance"), None);
+        assert_eq!(parse_collection_tag("criteria key(Substance) extra"), None);
+        assert_eq!(parse_collection_tag(""), None);
+    }
+
+    #[test]
+    fn a_domain_tag_names_either_a_collection_or_a_predicate() {
+        assert_eq!(
+            parse_domain_tag("Module consent_modules"),
+            Some(DomainTag {
+                argument: "Module".to_string(),
+                source: DomainSource::Collection("consent_modules".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_domain_tag("Color color/1"),
+            Some(DomainTag {
+                argument: "Color".to_string(),
+                source: DomainSource::Predicate {
+                    name: "color".to_string(),
+                    arity: 1,
+                },
+            })
+        );
+        assert_eq!(parse_domain_tag("Color"), None);
+        assert_eq!(parse_domain_tag("Color color/x"), None);
     }
 }

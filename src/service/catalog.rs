@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
-use crate::prolog::{Interpreter, KnowledgeBase, ModuleDoc};
+use serde_json::Value;
 
-use super::descriptors;
-use super::operation::{Operation, UnsupportedPredicate, Verb};
+use crate::prolog::{Interpreter, KnowledgeBase};
+
+use super::build;
+use super::collection::{Collection, CollectionError};
+use super::operation::{Domain, Operation, UnsupportedPredicate, Verb};
+use super::{Config, SharedConfig};
 
 pub const DEFAULT_TITLE: &str = "Charon Knowledge Base API";
 pub const DEFAULT_DESCRIPTION: &str = "Generated from a Prolog knowledge base: every documented \
@@ -15,106 +18,99 @@ pub const DEFAULT_DESCRIPTION: &str = "Generated from a Prolog knowledge base: e
      directly; any other predicate answers with an array holding one entry per solution, empty \
      if the query failed.";
 
-/// Everything derived from one revision of the source text, rendered once.
+/// Everything derived from one revision of the source text.
 ///
-/// The descriptor documents are built here rather than on every request: both are pure functions
-/// of the operations, the module doc and the crate version, none of which change while the
-/// server runs — `assertz` adds facts, not documented predicates.
+/// Nothing here changes while the server runs: `assertz` adds facts rather than documented
+/// predicates.
+/// That is what lets each adapter render its descriptor document once and cache it against
+/// [`Catalog::revision`].
 pub struct Catalog {
-    operations: Vec<Operation>,
-    /// Predicate name → index. Also the uniqueness check: MCP addresses a tool by this name, so
-    /// two operations answering to one name would make a call ambiguous.
-    by_name: HashMap<String, usize>,
-    /// (path, verb) → index. Two predicates colliding here would shadow each other over HTTP.
-    by_route: HashMap<(String, Verb), usize>,
-    module_doc: Option<ModuleDoc>,
-    source: String,
-    /// Predicates that were documented but could not be exposed, with the reason. Reported at
-    /// startup so a missing endpoint is diagnosable instead of mysterious.
-    rejected: Vec<(String, UnsupportedPredicate)>,
-    interpreter: Interpreter,
-    openapi_json: Arc<str>,
-    tools_json: Arc<str>,
-    etag: String,
+    pub(super) operations: Vec<Operation>,
+    /// Name → index. MCP addresses a tool by name, so this index is also the check that two
+    /// operations never answer to one name.
+    pub(super) by_name: HashMap<String, usize>,
+    /// (path, verb) → index. Two operations colliding here would shadow each other over HTTP.
+    pub(super) by_route: HashMap<(String, Verb), usize>,
+    pub(super) collections: Vec<Collection>,
+    pub(super) interpreter: Interpreter,
+    pub(super) config: SharedConfig,
+    pub(super) title: String,
+    pub(super) description: String,
+    pub(super) source: String,
+    /// Predicates that were documented but could not be exposed, with the reason.
+    pub(super) rejected: Vec<(String, UnsupportedPredicate)>,
+    pub(super) revision: u64,
 }
 
 impl Catalog {
     /// Builds everything derived from `knowledge_base`'s current source.
-    ///
-    /// Fails if the consult did not actually define the predicates the PlDoc comments promise.
-    /// scryer reports a failed consult by defining nothing at all and returns nothing to check,
-    /// so without this probe a knowledge base with one malformed clause starts up looking
-    /// healthy and then answers every single request with an existence error.
-    pub fn build(knowledge_base: &KnowledgeBase) -> Result<Self, CatalogError> {
-        let interpreter = knowledge_base.parse();
-        let predicates = knowledge_base.predicates();
+    pub fn build(
+        knowledge_base: &KnowledgeBase,
+        config: &SharedConfig,
+    ) -> Result<Self, CatalogError> {
+        build::catalog(knowledge_base, config)
+    }
 
-        let indicators: Vec<(&str, usize)> = predicates
-            .iter()
-            .map(|predicate| (predicate.name.as_str(), predicate.arguments.len()))
-            .collect();
-        let missing = interpreter.missing_predicates(indicators);
-        if !missing.is_empty() {
-            return Err(CatalogError::PredicatesMissing(missing));
-        }
-
-        let mut operations = Vec::new();
-        let mut rejected = Vec::new();
-        for predicate in predicates {
-            let name = predicate.name.clone();
-            match Operation::try_from(predicate) {
-                Ok(operation) => operations.push(operation),
-                Err(reason) => rejected.push((name, reason)),
-            }
-        }
-
-        let mut by_name = HashMap::with_capacity(operations.len());
-        let mut by_route = HashMap::with_capacity(operations.len());
-        for (index, operation) in operations.iter().enumerate() {
-            if by_name
-                .insert(operation.name().to_string(), index)
-                .is_some()
-            {
-                return Err(CatalogError::DuplicateName(operation.name().to_string()));
-            }
-            let route = (operation.path().to_string(), operation.verb());
-            if let Some(previous) = by_route.insert(route, index) {
-                return Err(CatalogError::CollidingRoute {
-                    first: operations[previous].name().to_string(),
-                    second: operation.name().to_string(),
-                    verb: operation.verb(),
-                    path: operation.path().to_string(),
-                });
-            }
-        }
-
-        let source = knowledge_base.source().to_string();
-        let module_doc = knowledge_base.module_doc();
-        let title = title_of(module_doc.as_ref());
-        let description = description_of(module_doc.as_ref());
-
-        let openapi_json: Arc<str> = descriptors::openapi(&operations, &title, &description).into();
-        let tools_json: Arc<str> = descriptors::mcp_tools(&operations).into();
-        // Hashed over the rendered document rather than the source, so that a Charon upgrade
-        // that changes how documents are rendered also invalidates a cached copy.
-        let etag = format!("\"{:x}\"", fnv1a(&openapi_json));
-
-        Ok(Catalog {
-            operations,
-            by_name,
-            by_route,
-            module_doc,
-            source,
-            rejected,
-            interpreter,
-            openapi_json,
-            tools_json,
-            etag,
-        })
+    /// A number that changes whenever anything derived from the source does. Adapters cache
+    /// their rendered documents against it.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn operations(&self) -> &[Operation] {
         &self.operations
+    }
+
+    /// Whether this catalog will actually run `operation`, as opposed to merely knowing about it.
+    ///
+    /// A changing operation is withheld unless the server was started with `--persist`: a server
+    /// that cannot write a change down has no business offering to make one, since the change
+    /// would live only in the running machine and vanish on restart, leaving the file it claims
+    /// to serve quietly wrong.
+    pub fn is_available(&self, operation: &Operation) -> bool {
+        self.config.persist || !operation.is_mutating()
+    }
+
+    /// The operations this process exposes. Every descriptor is rendered from exactly this set,
+    /// so what is documented and what is callable cannot disagree.
+    pub fn available(&self) -> impl Iterator<Item = &Operation> {
+        self.operations
+            .iter()
+            .filter(|operation| self.is_available(operation))
+    }
+
+    /// Operations the source documents but this process withholds. Reported at startup beside
+    /// [`Catalog::rejected`], so that a missing endpoint is diagnosable rather than mysterious.
+    pub fn withheld(&self) -> impl Iterator<Item = &Operation> {
+        self.operations
+            .iter()
+            .filter(|operation| !self.is_available(operation))
+    }
+
+    /// The tables declared with `@collection`.
+    pub fn collections(&self) -> &[Collection] {
+        &self.collections
+    }
+
+    /// The collection called `name`, if there is one.
+    pub fn collection(&self, name: &str) -> Option<&Collection> {
+        self.collections
+            .iter()
+            .find(|collection| collection.name() == name)
+    }
+
+    /// Every value in `domain`, asked of the live machine. Blocking.
+    pub(super) fn domain_values(&self, domain: &Domain) -> Vec<Value> {
+        build::domain_values(&self.interpreter, domain)
+    }
+
+    /// How many machines answer for this catalog.
+    pub fn width(&self) -> usize {
+        self.interpreter.width()
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Predicates that were documented but could not be exposed, and why.
@@ -122,17 +118,25 @@ impl Catalog {
         &self.rejected
     }
 
-    /// The knowledge base's source text, served as an MCP resource.
+    /// The knowledge base's source text.
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
     }
 
     pub(super) fn interpreter(&self) -> &Interpreter {
         &self.interpreter
     }
 
-    /// The operation exposing `name`, matched on the predicate's own name. This is the lookup
-    /// MCP uses, since a tool name is flat and keeps its verb prefix.
+    /// The operation answering to `name`. This is the lookup MCP uses, since a tool name is flat
+    /// and keeps its verb prefix.
     pub fn find(&self, name: &str) -> Option<&Operation> {
         self.by_name.get(name).map(|index| &self.operations[*index])
     }
@@ -141,36 +145,28 @@ impl Catalog {
     /// several operations can share a path.
     pub fn route(&self, path: &str, verb: Verb) -> Result<&Operation, RouteError> {
         if let Some(index) = self.by_route.get(&(path.to_string(), verb)) {
-            return Ok(&self.operations[*index]);
+            let operation = &self.operations[*index];
+            return match self.is_available(operation) {
+                true => Ok(operation),
+                false => Err(RouteError::Withheld {
+                    name: operation.name().to_string(),
+                }),
+            };
         }
+        // Only verbs this process will actually answer belong in `Allow`; advertising one that
+        // would be refused sends a caller to a second failure.
         let elsewhere: Vec<Verb> = Verb::ALL
             .into_iter()
-            .filter(|other| self.by_route.contains_key(&(path.to_string(), *other)))
+            .filter(|other| {
+                self.by_route
+                    .get(&(path.to_string(), *other))
+                    .is_some_and(|index| self.is_available(&self.operations[*index]))
+            })
             .collect();
         match elsewhere.is_empty() {
             true => Err(RouteError::NoSuchPath),
             false => Err(RouteError::WrongVerb { allowed: elsewhere }),
         }
-    }
-
-    pub fn openapi_json(&self) -> Arc<str> {
-        Arc::clone(&self.openapi_json)
-    }
-
-    pub fn tools_json(&self) -> Arc<str> {
-        Arc::clone(&self.tools_json)
-    }
-
-    pub fn etag(&self) -> &str {
-        &self.etag
-    }
-
-    pub fn title(&self) -> String {
-        title_of(self.module_doc.as_ref())
-    }
-
-    pub fn description(&self) -> String {
-        description_of(self.module_doc.as_ref())
     }
 }
 
@@ -179,42 +175,31 @@ impl fmt::Debug for Catalog {
         f.debug_struct("Catalog")
             .field("operations", &self.operations.len())
             .field("rejected", &self.rejected.len())
-            .field("etag", &self.etag)
+            .field("revision", &self.revision)
             .finish_non_exhaustive()
     }
-}
-
-fn title_of(module_doc: Option<&ModuleDoc>) -> String {
-    module_doc
-        .and_then(|doc| doc.title.clone())
-        .unwrap_or_else(|| DEFAULT_TITLE.to_string())
-}
-
-fn description_of(module_doc: Option<&ModuleDoc>) -> String {
-    module_doc
-        .and_then(|doc| doc.doc.render())
-        .unwrap_or_else(|| DEFAULT_DESCRIPTION.to_string())
-}
-
-/// FNV-1a, used only to give the descriptor documents a stable ETag.
-fn fnv1a(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    hash
 }
 
 /// Why a revision of a knowledge base could not be turned into a catalog.
 #[derive(Debug)]
 pub enum CatalogError {
+    /// The consult stopped before the end of the file, so what the machine holds is some prefix
+    /// of the knowledge base rather than the knowledge base.
+    ConsultFailed,
     /// The consult did not define these predicates, even though they are documented. Almost
     /// always one malformed clause earlier in the file.
     PredicatesMissing(Vec<String>),
-    /// Two documented predicates answer to one name, so a tool call would be ambiguous.
+    /// Two operations answer to one name, so a tool call would be ambiguous.
     DuplicateName(String),
-    /// Two documented predicates land on one HTTP route, so one would shadow the other.
+    /// A `@collection` declaration could not be turned into routes.
+    Collection(CollectionError),
+    /// A `@domain` tag names something the knowledge base does not enumerate.
+    UnknownDomain {
+        operation: String,
+        argument: String,
+        source: String,
+    },
+    /// Two operations land on one HTTP route, so one would shadow the other.
     CollidingRoute {
         first: String,
         second: String,
@@ -226,6 +211,14 @@ pub enum CatalogError {
 impl fmt::Display for CatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CatalogError::ConsultFailed => write!(
+                f,
+                "the knowledge base did not load completely.\n\
+                 A clause somewhere in the file failed to compile, which aborts scryer's consult \
+                 at that point and leaves everything after it undefined — look for a malformed \
+                 clause, or an arithmetic expression that cannot be evaluated, such as `X is \
+                 foo + 1`."
+            ),
             CatalogError::PredicatesMissing(missing) => write!(
                 f,
                 "the knowledge base loaded but does not define {}.\n\
@@ -238,6 +231,16 @@ impl fmt::Display for CatalogError {
                 f,
                 "`{name}` is documented more than once; a predicate is addressed by name, so \
                  there is no way to say which was meant."
+            ),
+            CatalogError::Collection(cause) => write!(f, "{cause}"),
+            CatalogError::UnknownDomain {
+                operation,
+                argument,
+                source,
+            } => write!(
+                f,
+                "`{operation}` declares that `{argument}` ranges over `{source}`, which is \
+                 neither a single-key collection nor a predicate this knowledge base defines."
             ),
             CatalogError::CollidingRoute {
                 first,
@@ -260,15 +263,24 @@ impl std::error::Error for CatalogError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteError {
     NoSuchPath,
-    WrongVerb { allowed: Vec<Verb> },
+    WrongVerb {
+        allowed: Vec<Verb>,
+    },
+    /// The path and method resolve, but the operation changes the knowledge base and this
+    /// process was started without `--persist`.
+    Withheld {
+        name: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Arc;
 
-    /// Writes `source` to a scratch file and builds a catalog from it.
+    /// Writes `source` to a scratch file and builds a catalog from it, with changing operations
+    /// exposed.
     fn catalog_for(source: &str) -> Result<Catalog, CatalogError> {
         let path = std::env::temp_dir().join(format!(
             "charon_catalog_{}_{:p}.pl",
@@ -280,7 +292,7 @@ mod tests {
         drop(file);
 
         let knowledge_base = KnowledgeBase::load(&path).unwrap();
-        let built = Catalog::build(&knowledge_base);
+        let built = Catalog::build(&knowledge_base, &Arc::new(Config::persisting(true)));
         let _ = std::fs::remove_file(&path);
         built
     }
@@ -301,8 +313,8 @@ mod tests {
             catalog.route("fruit", Verb::Delete).unwrap().name(),
             "delete_fruit"
         );
-        // The path exists, but not for this verb — which is a different answer from "no such
-        // path", and the two get different status codes.
+        // The path exists, but not for this verb — a different answer from "no such path", and
+        // the two get different status codes.
         assert_eq!(
             catalog.route("fruit", Verb::Post).unwrap_err(),
             RouteError::WrongVerb {
@@ -348,11 +360,10 @@ mod tests {
     }
 
     #[test]
-    fn the_etag_tracks_the_rendered_document() {
+    fn the_revision_tracks_the_source() {
         let one = catalog_for("%! a(-X:int) is det.\na(1).\n").unwrap();
         let other = catalog_for("%! b(-X:int) is det.\nb(1).\n").unwrap();
-        assert_ne!(one.etag(), other.etag());
-        assert!(one.etag().starts_with('"') && one.etag().ends_with('"'));
+        assert_ne!(one.revision(), other.revision());
     }
 
     #[test]

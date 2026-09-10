@@ -1,6 +1,7 @@
 //! The HTTP adapter: routing, argument extraction, and status codes.
 
-mod coerce;
+pub mod openapi;
+mod problem;
 mod serve;
 
 use std::sync::Arc;
@@ -15,9 +16,18 @@ use axum::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::service::{CallError, Operation, RouteError, Service, Verb};
+use crate::service::{KeyError, Operation, Service, Verb, value_from_text};
 
-pub use serve::{ServeError, serve};
+use problem::{Kind, Problem};
+
+pub use problem::PROBLEM_JSON;
+pub use serve::{ServeError, serve, serve_reloadable};
+
+/// Set when the solution cap cut an answer short, so a caller can tell "these are all the
+/// solutions" from "these are the first N". A header rather than a body field: the response
+/// schema promised by the OpenAPI document is exact, and wrapping the body in an envelope only
+/// when truncation happened would make it a `oneOf` again.
+pub const TRUNCATED_HEADER: &str = "x-charon-truncated";
 
 /// Builds the REST router: one route per predicate path, plus the OpenAPI document.
 ///
@@ -26,7 +36,8 @@ pub use serve::{ServeError, serve};
 /// was started rather than something a client discovers by probing.
 pub fn routes(service: Arc<Service>) -> Router {
     Router::new()
-        .route("/openapi.json", routing::get(openapi))
+        .route("/", routing::get(index))
+        .route("/openapi.json", routing::get(descriptor))
         .route(
             "/{predicate}",
             routing::get(call)
@@ -35,7 +46,24 @@ pub fn routes(service: Arc<Service>) -> Router {
                 .delete(call)
                 .patch(call),
         )
-        .with_state(service)
+        // One member of a collection. A wildcard because a key may have several columns
+        // (`/pairs/{Left}/{Right}`); a key value containing a `/` cannot be addressed, which is
+        // the ordinary limitation of putting an identifier in a path.
+        .route(
+            "/{collection}/{*key}",
+            routing::get(member).put(member).delete(member),
+        )
+        .with_state(Api {
+            service,
+            openapi: Arc::new(openapi::Cache::default()),
+        })
+}
+
+/// What every handler is given: the service, and the document rendered from its catalog.
+#[derive(Clone)]
+struct Api {
+    service: Arc<Service>,
+    openapi: Arc<openapi::Cache>,
 }
 
 /// The [`Verb`] a request method stands for, or `None` for a method Charon does not route.
@@ -50,15 +78,63 @@ pub fn verb_for(method: &Method) -> Option<Verb> {
     }
 }
 
-/// Serves the cached OpenAPI document, with an ETag so a docs UI polling it gets a 304 rather
-/// than the whole document again.
-async fn openapi(State(service): State<Arc<Service>>, headers: HeaderMap) -> Response {
-    let catalog = service.catalog();
+/// A plain index of what this server answers.
+///
+/// Exists so that opening the root in a browser explains the server rather than 404ing. It is
+/// also the only place that says out loud which operations are being *withheld* for want of
+/// `--persist` — the OpenAPI document deliberately does not mention them, because it describes
+/// what can be called.
+async fn index(State(state): State<Api>) -> Response {
+    let catalog = state.service.catalog();
+
+    let operations: Vec<Value> = catalog
+        .available()
+        .map(|operation| {
+            json!({
+                "operation": operation.name(),
+                "method": operation.verb().as_str().to_uppercase(),
+                "path": format!("/{}", operation.path()),
+                "summary": operation.summary(),
+            })
+        })
+        .collect();
+    let withheld: Vec<Value> = catalog
+        .withheld()
+        .map(|operation| {
+            json!({
+                "operation": operation.name(),
+                "reason": "changes the knowledge base; start charon with --persist to expose it",
+            })
+        })
+        .collect();
+
+    let mut body = json!({
+        "title": catalog.title(),
+        "description": catalog.description(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "openapi": "/openapi.json",
+        "operations": operations,
+    });
+    if !withheld.is_empty() {
+        body["withheld"] = json!(withheld);
+    }
+
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Serves the OpenAPI document, with an ETag so a docs UI polling it gets a 304 rather than the
+/// whole document again.
+async fn descriptor(State(state): State<Api>, headers: HeaderMap) -> Response {
+    let document = state.openapi.get(&state.service.catalog());
 
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == catalog.etag())
+        .is_some_and(|value| value == document.etag)
     {
         return StatusCode::NOT_MODIFIED.into_response();
     }
@@ -66,15 +142,15 @@ async fn openapi(State(service): State<Arc<Service>>, headers: HeaderMap) -> Res
     (
         [
             (header::CONTENT_TYPE, "application/json"),
-            (header::ETAG, catalog.etag()),
+            (header::ETAG, document.etag.as_str()),
         ],
-        catalog.openapi_json().to_string(),
+        document.json.to_string(),
     )
         .into_response()
 }
 
 async fn call(
-    State(service): State<Arc<Service>>,
+    State(Api { service, .. }): State<Api>,
     Path(path): Path<String>,
     method: Method,
     Query(query): Query<Vec<(String, String)>>,
@@ -84,20 +160,24 @@ async fn call(
     let catalog = service.catalog();
 
     let Some(verb) = verb_for(&method) else {
-        return error(StatusCode::METHOD_NOT_ALLOWED, "unsupported HTTP method");
+        return Problem::new(
+            Kind::UnsupportedMethod,
+            format!("charon does not route {method} requests"),
+        )
+        .into_response();
     };
 
+    // A HEAD request runs the query, exactly as a GET would. That is deliberate rather than
+    // wasteful: HEAD promises the headers a GET would return, and answering it without asking
+    // the knowledge base would report success for a query that in fact fails.
     let operation = match catalog.route(&path, verb) {
         Ok(operation) => operation,
-        Err(RouteError::NoSuchPath) => {
-            return error(StatusCode::NOT_FOUND, format!("no predicate at /{path}"));
-        }
-        Err(RouteError::WrongVerb { allowed }) => return method_not_allowed(&path, &allowed),
+        Err(cause) => return problem::for_route(&path, cause).into_response(),
     };
 
     let arguments = match arguments_for(operation, &query, &headers, &body) {
         Ok(arguments) => arguments,
-        Err((status, message)) => return error(status, message),
+        Err(problem) => return problem.into_response(),
     };
 
     let name = operation.name().to_string();
@@ -105,13 +185,151 @@ async fn call(
         .call(Arc::clone(&catalog), name, arguments)
         .await
     {
-        Ok(value) => (
+        Ok(outcome) => {
+            let mut response = (
+                [(header::CONTENT_TYPE, "application/json")],
+                outcome.value.to_string(),
+            )
+                .into_response();
+            if outcome.truncated {
+                response
+                    .headers_mut()
+                    .insert(TRUNCATED_HEADER, header::HeaderValue::from_static("true"));
+            }
+            response
+        }
+        Err(cause) => problem::for_call(&cause).into_response(),
+    }
+}
+
+/// One member of a collection, addressed by its key.
+async fn member(
+    State(Api { service, .. }): State<Api>,
+    Path((name, key)): Path<(String, String)>,
+    method: Method,
+    Query(query): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let catalog = service.catalog();
+
+    let Some(verb) = verb_for(&method) else {
+        return Problem::new(
+            Kind::UnsupportedMethod,
+            format!("charon does not route {method} requests"),
+        )
+        .into_response();
+    };
+
+    let Some(collection) = catalog.collection(&name) else {
+        return Problem::new(
+            Kind::NoSuchPath,
+            format!("no collection is exposed at /{name}"),
+        )
+        .with("path", json!(format!("/{name}")))
+        .into_response();
+    };
+
+    // Which verbs this member answers depends both on whether the facts can change at all and
+    // on whether this process was started to allow changes.
+    let allowed: Vec<Verb> = collection
+        .item_verbs()
+        .into_iter()
+        .filter(|verb| {
+            collection
+                .item_operation(*verb)
+                .and_then(|name| catalog.find(&name))
+                .is_some_and(|operation| catalog.is_available(operation))
+        })
+        .collect();
+
+    let operation = match collection
+        .item_operation(verb)
+        .and_then(|name| catalog.find(&name))
+    {
+        Some(operation) if catalog.is_available(operation) => operation,
+        // The route exists but this process declines to run it: say so, rather than pretending
+        // the member is not addressable at all.
+        Some(operation) => {
+            return problem::for_call(&crate::service::CallError::Withheld {
+                name: operation.name().to_string(),
+            })
+            .into_response();
+        }
+        None => {
+            let allow = problem::allow_header(&allowed);
+            return Problem::new(
+                Kind::MethodNotAllowed,
+                format!("/{name} members do not answer this method; try {allow}"),
+            )
+            .with("allowed", json!(allow))
+            .with_header(header::ALLOW, allow)
+            .into_response();
+        }
+    };
+
+    // A path segment is text, exactly like a query-string value, and both are read by the same
+    // code — as is an MCP collection URI, so the three cannot disagree about what `null` is.
+    let key_arguments = match collection.key_arguments(&key) {
+        Ok(arguments) => arguments,
+        // The key names a different number of columns than this collection has, so it does not
+        // address a member at all.
+        Err(KeyError::WrongLength { expected, found }) => {
+            return Problem::new(
+                Kind::NoSuchPath,
+                format!("/{name} is keyed on {expected} column(s), but {found} were given"),
+            )
+            .into_response();
+        }
+        Err(KeyError::Invalid { argument, message }) => {
+            return Problem::new(Kind::ArgumentInvalid, format!("`{argument}`: {message}"))
+                .with("argument", json!(argument))
+                .into_response();
+        }
+    };
+
+    let mut arguments = match arguments_for(operation, &query, &headers, &body) {
+        Ok(arguments) => arguments,
+        Err(problem) => return problem.into_response(),
+    };
+    for (name, value) in key_arguments {
+        if arguments.contains_key(&name) {
+            return Problem::new(
+                Kind::ArgumentDuplicated,
+                format!("`{name}` identifies the member and cannot also be given as an argument"),
+            )
+            .with("argument", json!(name))
+            .into_response();
+        }
+        arguments.insert(name, value);
+    }
+
+    let operation_name = operation.name().to_string();
+    match Arc::clone(&service)
+        .call(Arc::clone(&catalog), operation_name, arguments)
+        .await
+    {
+        // Every member route is `semidet` or `det`, so "no solution" means "no such member" —
+        // which over HTTP is a 404 rather than a 200 carrying `null`.
+        Ok(outcome) if is_absent(&outcome.value) => {
+            Problem::new(Kind::NoSuchPath, format!("/{name} has no member {key}")).into_response()
+        }
+        Ok(outcome) => (
             [(header::CONTENT_TYPE, "application/json")],
-            value.to_string(),
+            outcome.value.to_string(),
         )
             .into_response(),
-        Err(cause) => call_error(&cause),
+        Err(cause) => problem::for_call(&cause).into_response(),
     }
+}
+
+/// Whether a member route's answer means "there is no such member".
+///
+/// A `semidet` operation with outputs answers `null` when it failed, and one without outputs
+/// answers `false`. Neither can be confused with a found member: an atom column comes back as
+/// the string `"false"`, never as the boolean.
+fn is_absent(value: &Value) -> bool {
+    matches!(value, Value::Null | Value::Bool(false))
 }
 
 /// Collects an operation's arguments from wherever this request put them.
@@ -126,21 +344,24 @@ fn arguments_for(
     query: &[(String, String)],
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<Map<String, Value>, (StatusCode, String)> {
+) -> Result<Map<String, Value>, Problem> {
     let mut arguments = json_body(headers, body)?;
 
     for (name, raw) in query {
         if arguments.contains_key(name) {
-            return Err((
-                StatusCode::BAD_REQUEST,
+            return Err(Problem::new(
+                Kind::ArgumentDuplicated,
                 format!("argument `{name}` was given both in the query string and in the body"),
-            ));
+            )
+            .with("argument", json!(name)));
         }
         // An unknown name is left in place rather than coerced: the service reports it, so a
         // misspelling is named once, in the same words, for both transports.
-        let value = match operation.inputs().iter().find(|param| param.name == *name) {
-            Some(param) => coerce::from_query(&param.declared_type, raw)
-                .map_err(|message| (StatusCode::BAD_REQUEST, format!("`{name}`: {message}")))?,
+        let value = match operation.inputs().find(|param| param.name == *name) {
+            Some(param) => value_from_text(&param.declared_type, raw).map_err(|message| {
+                Problem::new(Kind::ArgumentInvalid, format!("`{name}`: {message}"))
+                    .with("argument", json!(name))
+            })?,
             None => Value::String(raw.clone()),
         };
         arguments.insert(name.clone(), value);
@@ -150,10 +371,7 @@ fn arguments_for(
 }
 
 /// Reads the request body as a JSON object of arguments. An empty body is simply no arguments.
-fn json_body(
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Result<Map<String, Value>, (StatusCode, String)> {
+fn json_body(headers: &HeaderMap, body: &Bytes) -> Result<Map<String, Value>, Problem> {
     if body.is_empty() {
         return Ok(Map::new());
     }
@@ -167,61 +385,21 @@ fn json_body(
         .next()
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
     {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        return Err(Problem::new(
+            Kind::UnsupportedMediaType,
             format!("expected `application/json`, got `{content_type}`"),
         ));
     }
 
     match serde_json::from_slice::<Value>(body) {
         Ok(Value::Object(object)) => Ok(object),
-        Ok(_) => Err((
-            StatusCode::BAD_REQUEST,
-            "the request body must be a JSON object of arguments".to_string(),
+        Ok(_) => Err(Problem::new(
+            Kind::MalformedRequest,
+            "the request body must be a JSON object of arguments",
         )),
-        Err(cause) => Err((
-            StatusCode::BAD_REQUEST,
+        Err(cause) => Err(Problem::new(
+            Kind::MalformedRequest,
             format!("the request body is not valid JSON: {cause}"),
         )),
     }
-}
-
-fn method_not_allowed(path: &str, allowed: &[Verb]) -> Response {
-    let allow = allowed
-        .iter()
-        .flat_map(|verb| match verb {
-            // A route answering GET answers HEAD too, and `Allow` is meant to be exhaustive.
-            Verb::Get => vec!["GET".to_string(), "HEAD".to_string()],
-            other => vec![other.as_str().to_uppercase()],
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        [
-            (header::CONTENT_TYPE, "application/json".to_string()),
-            (header::ALLOW, allow.clone()),
-        ],
-        json!({ "error": format!("/{path} does not answer this method; try {allow}") }).to_string(),
-    )
-        .into_response()
-}
-
-fn call_error(cause: &CallError) -> Response {
-    let status = match cause {
-        CallError::UnknownOperation { .. } => StatusCode::NOT_FOUND,
-        CallError::Argument(_) | CallError::Prolog(_) => StatusCode::BAD_REQUEST,
-        CallError::Interrupted => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    error(status, cause.to_string())
-}
-
-fn error(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        json!({ "error": message.into() }).to_string(),
-    )
-        .into_response()
 }

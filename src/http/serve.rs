@@ -3,15 +3,32 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Router;
 use tokio::net::TcpListener;
+
+use crate::service::Service;
 
 /// Serves `router` on `address` until the process is asked to shut down.
 ///
 /// In-flight requests are allowed to finish: a `SIGINT` in the middle of a Prolog query that is
 /// about to `assertz` should not take the answer — or the file write that follows it — with it.
 pub async fn serve(router: Router, address: SocketAddr) -> Result<(), ServeError> {
+    serve_reloadable(router, address, None).await
+}
+
+/// [`serve`], with `SIGHUP` re-reading the knowledge base from disk.
+///
+/// A signal rather than an endpoint. Charon has no authentication, so an HTTP reload route would
+/// let anyone who can reach the port force a re-read of the file — and a reload is the one
+/// operation that can change what every subsequent request answers. A signal can only be sent by
+/// someone who can already signal the process.
+pub async fn serve_reloadable(
+    router: Router,
+    address: SocketAddr,
+    service: Option<Arc<Service>>,
+) -> Result<(), ServeError> {
     let listener = TcpListener::bind(address)
         .await
         .map_err(|cause| ServeError::Bind { address, cause })?;
@@ -27,11 +44,51 @@ pub async fn serve(router: Router, address: SocketAddr) -> Result<(), ServeError
     }
     tracing::info!(address = %bound, "listening");
 
+    if let Some(service) = service {
+        tokio::spawn(reload_on_hangup(service));
+    }
+
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_requested())
         .await
         .map_err(ServeError::Serve)
 }
+
+/// Re-reads the knowledge base whenever the process is sent `SIGHUP`.
+///
+/// A failed reload is logged and otherwise ignored: [`Service::reload`] leaves the previous
+/// catalog in place, so a half-saved file degrades to "the last good version keeps serving"
+/// rather than to a dead server.
+#[cfg(unix)]
+async fn reload_on_hangup(service: Arc<Service>) {
+    let Ok(mut hangup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+    else {
+        tracing::warn!("cannot listen for SIGHUP; reloading on signal is unavailable");
+        return;
+    };
+    tracing::debug!("SIGHUP will reload the knowledge base");
+
+    while hangup.recv().await.is_some() {
+        tracing::info!(path = %service.path().display(), "reloading on SIGHUP");
+        match service.reload() {
+            Ok(()) => {
+                let catalog = service.catalog();
+                tracing::info!(
+                    operations = catalog.available().count(),
+                    withheld = catalog.withheld().count(),
+                    "reloaded"
+                );
+            }
+            // Worth an error rather than a warning: the operator asked for something and did not
+            // get it, and is otherwise serving an older file than they think.
+            Err(error) => tracing::error!(%error, "reload failed; the previous version is still \
+                                                   being served"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_on_hangup(_service: Arc<Service>) {}
 
 /// Resolves when the process is asked to stop, by `SIGINT` or (on Unix) `SIGTERM`.
 async fn shutdown_requested() {

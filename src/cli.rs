@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::service::{Config, Service};
+use crate::service::{Config, Origin, Service};
 use crate::{http, mcp};
 
 /// Exposes a Prolog knowledge base as an HTTP/JSON API or as an MCP server.
@@ -45,8 +45,25 @@ pub struct Source {
     pub path: PathBuf,
 
     /// Mirror `assertz`/`retract` changes back into the knowledge base file.
+    ///
+    /// Also the gate on changing operations: without this, a predicate whose name begins
+    /// `put_`, `post_`, `patch_` or `delete_` is not exposed at all.
     #[arg(long)]
     pub persist: bool,
+
+    /// The most solutions one call may collect before reporting itself cut short. `0` removes
+    /// the bound, which lets a knowledge base describing an endless relation exhaust memory.
+    #[arg(long, default_value_t = crate::service::DEFAULT_MAX_SOLUTIONS, value_name = "N")]
+    pub max_solutions: usize,
+
+    /// How many Prolog machines to answer from in parallel.
+    ///
+    /// A machine is a lock, so one machine means every request waits for every other. Ignored —
+    /// and forced to one — for a knowledge base that modifies itself, or with `--persist`, where
+    /// a second machine would simply disagree with the first. Each one holds a full copy of the
+    /// rules, so this costs memory. Defaults to the number of cores, capped at four.
+    #[arg(long, value_name = "N")]
+    pub interpreters: Option<usize>,
 }
 
 /// Where to listen — shared by the two serving subcommands.
@@ -97,8 +114,11 @@ pub struct CheckArgs {
 
 impl Source {
     fn config(&self) -> Config {
+        let default = Config::default();
         Config {
             persist: self.persist,
+            max_solutions: (self.max_solutions > 0).then_some(self.max_solutions),
+            interpreters: self.interpreters.unwrap_or(default.interpreters),
         }
     }
 }
@@ -117,8 +137,8 @@ pub fn main() -> ExitCode {
     }
 }
 
-/// Diagnostics go to stderr on every subcommand, not just the stdio one: `charon openapi kb.pl >
-/// openapi.json` should produce a document, not a document with a log line in the middle of it.
+/// Diagnostics go to stderr on every subcommand, so `charon openapi kb.pl > openapi.json`
+/// produces a clean document rather than one with a log line in the middle of it.
 fn init_logging(filter: &str) {
     use tracing_subscriber::EnvFilter;
 
@@ -138,37 +158,48 @@ fn run(command: Command) -> Result<(), Box<dyn std::error::Error>> {
         Command::Check(args) => {
             let service = open(&args.source)?;
             report(&service);
-            println!(
-                "{} operation(s) exposed from {}",
-                service.catalog().operations().len(),
-                service.path().display()
-            );
+            let catalog = service.catalog();
+            let exposed = catalog.available().count();
+            let withheld = catalog.withheld().count();
+            match withheld {
+                0 => println!(
+                    "{exposed} operation(s) exposed from {}",
+                    service.path().display()
+                ),
+                withheld => println!(
+                    "{exposed} operation(s) exposed, {withheld} withheld (pass --persist) from {}",
+                    service.path().display()
+                ),
+            }
             Ok(())
         }
         Command::Openapi(args) => {
             let service = open(&args.source)?;
             report(&service);
-            println!("{}", service.catalog().openapi_json());
+            println!("{}", http::openapi::document(&service.catalog()));
             Ok(())
         }
         Command::Http(args) => {
             let service = Arc::new(open(&args.source)?);
             report(&service);
-            block_on(http::serve(
+            block_on(http::serve_reloadable(
                 http::routes(Arc::clone(&service)),
                 args.listen.address(),
+                Some(Arc::clone(&service)),
             ))?;
             Ok(())
         }
         Command::Mcp(args) => {
             let service = Arc::new(open(&args.source)?);
             report(&service);
+            let server = mcp::Server::new(Arc::clone(&service));
             if args.stdio {
-                block_on(mcp::serve_stdio(service))?;
+                block_on(mcp::serve_stdio(server))?;
             } else {
-                block_on(http::serve(
-                    mcp::routes(Arc::clone(&service)),
+                block_on(http::serve_reloadable(
+                    mcp::routes(server),
                     args.listen.address(),
+                    Some(service),
                 ))?;
             }
             Ok(())
@@ -180,15 +211,61 @@ fn open(source: &Source) -> Result<Service, crate::service::StartupError> {
     Service::open(&source.path, source.config())
 }
 
-/// Predicates a knowledge base documents but Charon cannot expose. Reported once, at startup,
-/// because "the endpoint is simply not there" is otherwise a mystery with no error attached.
+/// What a knowledge base documents but this process will not answer — predicates Charon cannot
+/// expose at all, and operations it is withholding for want of `--persist`. Reported once, at
+/// startup, because "the endpoint is simply not there" is otherwise a mystery with no error
+/// attached.
 fn report(service: &Service) {
     let catalog = service.catalog();
     for (name, reason) in catalog.rejected() {
         tracing::warn!(predicate = %name, "documented but not exposed: {reason}");
     }
+    // A predicate that declares a collection answers under the collection's name rather than its
+    // own, so say which name to look for: `/book` being absent while `/books` answers is the sort
+    // of thing a reader would otherwise take for a fault. A collection called after its own
+    // predicate needs no such line, since nothing moved.
+    for collection in catalog
+        .collections()
+        .iter()
+        .filter(|collection| collection.name() != collection.predicate())
+    {
+        tracing::info!(
+            predicate = %collection.predicate(),
+            collection = %collection.name(),
+            "exposed as a collection rather than as a predicate",
+        );
+    }
+    // The same courtesy for operations that *could* be exposed but are not: an endpoint that is
+    // simply absent is otherwise a mystery with no error attached, and forgetting `--persist` is
+    // by far the likeliest reason for one to go missing.
+    //
+    // A collection's generated routes are reported as the collection rather than one line per
+    // route: `books__put` is an internal name, and naming it would send a reader looking for a
+    // predicate that does not exist.
+    let mut read_only_collections: Vec<&str> = Vec::new();
+    for operation in catalog.withheld() {
+        match operation.origin() {
+            Origin::Predicate => tracing::warn!(
+                predicate = %operation.name(),
+                "withheld: changes the knowledge base; pass --persist to expose it",
+            ),
+            Origin::Collection(name) => {
+                if !read_only_collections.contains(&name.as_str()) {
+                    read_only_collections.push(name);
+                }
+            }
+        }
+    }
+    for name in read_only_collections {
+        tracing::warn!(
+            collection = %name,
+            "read-only: members cannot be added or removed; pass --persist to allow it",
+        );
+    }
     tracing::info!(
-        operations = catalog.operations().len(),
+        operations = catalog.available().count(),
+        withheld = catalog.withheld().count(),
+        interpreters = catalog.width(),
         persisting = service.is_persisting(),
         path = %service.path().display(),
         "knowledge base loaded"
@@ -223,8 +300,8 @@ mod tests {
 
     #[test]
     fn an_interface_must_be_chosen() {
-        // The old CLI served both at once and inferred the rest; now the choice is the first
-        // thing said, and saying nothing is an error rather than a default.
+        // An interface must be named explicitly; saying nothing is an error rather than a
+        // default.
         assert!(parse(&["kb.pl"]).is_err());
         assert!(parse(&[]).is_err());
     }
@@ -236,7 +313,7 @@ mod tests {
         };
         assert_eq!(args.source.path, PathBuf::from("kb.pl"));
         assert!(!args.source.persist);
-        // Not 0.0.0.0: a knowledge base should not become reachable from the network by
+        // Loopback, so that a knowledge base does not become reachable from the network by
         // default just because it was started.
         assert_eq!(args.listen.address().to_string(), "127.0.0.1:3000");
     }
@@ -282,8 +359,8 @@ mod tests {
 
     #[test]
     fn a_malformed_port_or_host_is_refused_rather_than_defaulted() {
-        // The hand-rolled parser this replaced fell back to the default port, so a typo meant
-        // listening somewhere other than where you asked.
+        // A malformed port or host is refused: falling back to the default would mean listening
+        // somewhere other than where it was asked to.
         assert!(parse(&["http", "kb.pl", "--port", "nonsense"]).is_err());
         assert!(parse(&["http", "kb.pl", "--port"]).is_err());
         assert!(parse(&["http", "kb.pl", "--port", "70000"]).is_err());
@@ -303,8 +380,42 @@ mod tests {
                 Command::Check(args) | Command::Openapi(args) => args.source,
             };
             assert!(source.persist, "{arguments:?}");
-            assert_eq!(source.config(), Config { persist: true });
+            assert_eq!(source.config(), Config::persisting(true));
         }
+    }
+
+    #[test]
+    fn the_solution_cap_is_bounded_by_default_and_can_be_lifted() {
+        // An unbounded default would let a single endless relation exhaust the process, so the
+        // bound is on unless it is explicitly removed.
+        let source = match parse(&["http", "kb.pl"]).unwrap().command {
+            Command::Http(args) => args.source,
+            _ => panic!("expected the http subcommand"),
+        };
+        assert_eq!(
+            source.config().max_solutions,
+            Some(crate::service::DEFAULT_MAX_SOLUTIONS)
+        );
+
+        let source = match parse(&["http", "kb.pl", "--max-solutions", "0"])
+            .unwrap()
+            .command
+        {
+            Command::Http(args) => args.source,
+            _ => panic!("expected the http subcommand"),
+        };
+        assert_eq!(source.config().max_solutions, None);
+
+        let source = match parse(&["mcp", "kb.pl", "--max-solutions", "5"])
+            .unwrap()
+            .command
+        {
+            Command::Mcp(args) => args.source,
+            _ => panic!("expected the mcp subcommand"),
+        };
+        assert_eq!(source.config().max_solutions, Some(5));
+
+        assert!(parse(&["http", "kb.pl", "--max-solutions", "nonsense"]).is_err());
     }
 
     #[test]

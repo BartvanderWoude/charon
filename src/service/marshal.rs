@@ -1,22 +1,60 @@
-//! Building a Prolog goal out of JSON arguments.
+//! Carrying arguments between JSON and Prolog, in both directions.
+//!
+//! Conversion is driven by the *declared* type, recursively, so a JSON string yields the same
+//! term whether it arrives on its own or inside a list: `atom` and `list(atom)` agree, and a
+//! knowledge base matching plain facts needs no conversion clauses of its own.
+//!
+//! The way back is nearly all handled by [`crate::prolog::to_json`], which reads a term without
+//! being told what it was declared to be — deliberately, because an `atom` and a `string` are
+//! both just text to whoever reads the response. [`json_for`] handles the one case where that
+//! is not enough.
 
 use std::fmt;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::prolog::{Type, quote_atom, quote_string};
+
+/// Adjusts a term's JSON to what its declared type promised.
+///
+/// [`crate::prolog::to_json`] maps a term by its own shape, which is right for almost every
+/// type: an atom and a string are both text, and a caller wants the text. `bool` is the
+/// exception. Prolog has no boolean — it has the atoms `true` and `false` — so a term-shaped
+/// mapping yields the JSON *string* `"true"` while the schema Charon publishes for that same
+/// argument says `"type": "boolean"`. A client validating against the OpenAPI document then
+/// rejects a response Charon generated from its own description of itself.
+///
+/// Only that mismatch is repaired, and only for values that are actually `true` or `false`. An
+/// output declared `bool` and bound to something else is a defective knowledge base, and
+/// guessing what it meant would hide the defect rather than report it; the value is passed
+/// through as it came so that what is wrong stays visible.
+pub fn json_for(value: Value, declared: &Type) -> Value {
+    match declared {
+        Type::Boolean => match value.as_str() {
+            Some("true") => Value::Bool(true),
+            Some("false") => Value::Bool(false),
+            _ => value,
+        },
+        Type::List(element) => match value {
+            Value::Array(items) => Value::Array(
+                items.into_iter().map(|item| json_for(item, element)).collect(),
+            ),
+            other => other,
+        },
+        _ => value,
+    }
+}
 
 /// The name Charon prefers for the variable a generated goal binds a caught exception to.
 const ERROR_VARIABLE: &str = "CharonError__";
 
 /// A variable name for the caught exception that none of `argument_variables` already uses.
 ///
-/// An argument literally named `charonError__` would otherwise collide, since [`variable_name`]
-/// upper-cases the first character — so rather than assume the base name is unique, take it and
-/// widen it until it is.
-pub fn error_variable(argument_variables: &[String]) -> String {
+/// An argument literally named `charonError__` becomes the variable `CharonError__`, so the base
+/// name cannot simply be assumed unique: widen it until it is.
+pub fn error_variable(argument_variables: &[&str]) -> String {
     let mut name = ERROR_VARIABLE.to_string();
-    while argument_variables.contains(&name) {
+    while argument_variables.contains(&name.as_str()) {
         name.push('_');
     }
     name
@@ -26,20 +64,45 @@ pub fn error_variable(argument_variables: &[String]) -> String {
 ///
 /// An exception that reaches scryer's top level leaves the machine unusable: every later query,
 /// including ones against unrelated predicates, keeps returning that same stale error. Catching
-/// it inside the query is what keeps a single bad request from poisoning the process — and it
-/// means knowledge bases don't need defensive `catch/3` wrappers of their own.
+/// it inside the query keeps one bad request from poisoning the process, and means a knowledge
+/// base needs no defensive `catch/3` wrappers of its own.
 pub fn wrap_goal(goal: &str, error_variable: &str) -> String {
     format!("catch({goal}, {error_variable}, true).")
 }
 
-/// Prolog variables must start with an upper-case letter or underscore; PlDoc argument names
-/// don't have to, so this derives a valid, argument-specific variable name (`len` → `Len`).
-pub fn variable_name(argument_name: &str) -> String {
-    let mut characters = argument_name.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
-        None => String::new(),
+/// Renders a `{"functor": "dose", "args": [500, "mg"]}` object as the term `dose(500,mg)`.
+///
+/// Arguments are marshalled as `any`, so they nest: a compound argument of a compound term is
+/// just another object. A functor with no arguments is an atom, which is what Prolog means by a
+/// compound of arity zero.
+fn compound_term(object: &Map<String, Value>) -> Result<String, TypeMismatch> {
+    let Some(functor) = object.get("functor").and_then(Value::as_str) else {
+        return Err(TypeMismatch {
+            expected: "a compound term with a string `functor`".to_string(),
+            found: describe(&Value::Object(object.clone())),
+        });
+    };
+
+    let arguments = match object.get("args") {
+        Some(Value::Array(arguments)) => arguments.as_slice(),
+        // Absent is the same as none; anything else is a mistake worth naming.
+        None | Some(Value::Null) => &[],
+        Some(other) => {
+            return Err(TypeMismatch {
+                expected: "`args` to be an array".to_string(),
+                found: describe(other),
+            });
+        }
+    };
+
+    if arguments.is_empty() {
+        return Ok(quote_atom(functor));
     }
+    let terms = arguments
+        .iter()
+        .map(|argument| term_for(argument, &Type::Any))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!("{}({})", quote_atom(functor), terms.join(",")))
 }
 
 /// A supplied argument that doesn't fit its declared type.
@@ -100,8 +163,7 @@ pub fn term_for(value: &Value, declared: &Type) -> Result<String, TypeMismatch> 
             other => Err(mismatch("an array", other)),
         },
         // Undeclared: map each JSON type to its most idiomatic Prolog counterpart. Strings
-        // become atoms, matching the scalar `atom` case, so an author who declares nothing gets
-        // the representation they would have reached for anyway.
+        // become atoms, matching the scalar `atom` case.
         Type::Any => match value {
             Value::String(text) => Ok(quote_atom(text)),
             Value::Number(number) => Ok(number.to_string()),
@@ -113,9 +175,17 @@ pub fn term_for(value: &Value, declared: &Type) -> Result<String, TypeMismatch> 
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(format!("[{}]", terms.join(",")))
             }
-            other => Err(mismatch("a scalar or array", other)),
+            // An object in the `{functor, args}` encoding is a compound term. Accepted here as
+            // well as under `compound`, so a structured answer can be handed straight back as an
+            // argument without re-declaring its type.
+            Value::Object(object) => compound_term(object),
+            other => Err(mismatch("a scalar, array or compound term", other)),
         },
-        Type::Compound | Type::Stream | Type::Custom(_) => Err(TypeMismatch {
+        Type::Compound => match value {
+            Value::Object(object) => compound_term(object),
+            other => Err(mismatch("a compound term", other)),
+        },
+        Type::Stream | Type::Custom(_) => Err(TypeMismatch {
             expected: format!("a type Charon can marshal (got `{declared}`)"),
             found: describe(value),
         }),
@@ -151,8 +221,8 @@ mod tests {
 
     #[test]
     fn scalar_atoms_and_list_atoms_agree() {
-        // The whole point of the type change: one JSON string yields the same Prolog term
-        // whether it arrives on its own or inside a list.
+        // One JSON string yields the same Prolog term whether it arrives on its own or inside
+        // a list, which is what lets one knowledge base match both.
         assert_eq!(
             term_for(&json!("diazepam"), &Type::Atom).unwrap(),
             "diazepam"
@@ -198,8 +268,8 @@ mod tests {
             term_for(&json!(i64::MIN), &Type::Integer).unwrap(),
             i64::MIN.to_string()
         );
-        // Above `i64::MAX` is still an integer to both serde_json and Prolog; rejecting it was
-        // an artefact of reading every number through `as_i64`.
+        // Above `i64::MAX` is still an integer to both serde_json and Prolog, so reading every
+        // number through `as_i64` would reject it wrongly.
         assert_eq!(
             term_for(&json!(u64::MAX), &Type::Integer).unwrap(),
             u64::MAX.to_string()
@@ -219,7 +289,7 @@ mod tests {
     #[test]
     fn a_value_cannot_escape_its_quotes_into_the_surrounding_goal() {
         // An argument is interpolated into generated Prolog source, so text that closes its own
-        // quote and continues with a new goal has to come back escaped, not executed.
+        // quote and continues with a new goal has to come back escaped rather than executed.
         let injected = "x'), assertz(owned(true)), foo('";
         assert_eq!(
             term_for(&json!(injected), &Type::Atom).unwrap(),
@@ -254,13 +324,8 @@ mod tests {
 
     #[test]
     fn error_variable_steps_aside_for_a_colliding_argument() {
-        assert_eq!(variable_name("len"), "Len");
-        assert_eq!(variable_name(""), "");
-
         // An argument named `charonError__` upper-cases straight onto the preferred name.
-        let colliding = vec![variable_name("charonError__")];
-        assert_eq!(colliding[0], ERROR_VARIABLE);
-        assert_eq!(error_variable(&colliding), "CharonError___");
+        assert_eq!(error_variable(&[ERROR_VARIABLE]), "CharonError___");
         assert_eq!(error_variable(&[]), ERROR_VARIABLE);
     }
 }

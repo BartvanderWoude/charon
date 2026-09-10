@@ -14,7 +14,7 @@ regex = "1.13.1"
 scryer-prolog = { git = "https://github.com/mthom/scryer-prolog.git", default-features = false, rev = "295a642" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "io-std", "io-util", "macros", "signal"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "io-std", "io-util", "macros", "signal", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

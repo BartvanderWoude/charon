@@ -70,9 +70,9 @@ pub(super) fn parse_dynamic_directives(source: &str) -> Vec<DynamicPredicate> {
 
 /// If `line` holds exactly one ground fact clause, its functor and arity.
 ///
-/// The arity matters, and getting it wrong loses data: `:- dynamic(f/1).` used to claim every
-/// line beginning `f(` — including a `f(a, b).` belonging to an entirely different `f/2` — and
-/// then deleted it for not being among `f/1`'s live facts.
+/// The arity matters, and getting it wrong loses data: matching `:- dynamic(f/1).` against every
+/// line beginning `f(` would claim a `f(a, b).` belonging to an entirely different `f/2` and then
+/// delete it for not being among `f/1`'s live facts.
 pub(super) fn fact_line_indicator(line: &str) -> Option<(&str, usize)> {
     let text = line.trim().strip_suffix('.')?.trim_end();
 
@@ -266,8 +266,8 @@ mod tests {
 
     #[test]
     fn arity_is_part_of_the_match() {
-        // The bug this pins: `:- dynamic(f/1).` used to claim `f(a, b).` — a clause of the
-        // unrelated `f/2` — and then delete it for not being one of `f/1`'s live facts.
+        // Arity is part of the match: `:- dynamic(f/1).` must not claim `f(a, b).` — a clause of
+        // the unrelated `f/2` — and then delete it for not being one of `f/1`'s live facts.
         assert!(!is_fact_line("example(a, b).", &predicate("example", 1)));
         assert!(is_fact_line("example(a, b).", &predicate("example", 2)));
         assert!(is_fact_line("ready.", &predicate("ready", 0)));

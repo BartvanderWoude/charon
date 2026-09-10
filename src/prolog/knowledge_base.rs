@@ -9,11 +9,6 @@ use super::persistence::{self, DynamicPredicate};
 use super::{Interpreter, ModuleDoc, Predicate};
 
 /// A knowledge base's source text, together with the path it came from.
-///
-/// Nothing here holds the file open. An earlier version kept a read-write handle "to claim
-/// exclusivity", which it did not — no lock was ever taken — while making a read-only `.pl` file
-/// impossible to serve at all. Writes now go through [`replace_atomically`] instead, so a
-/// concurrent editor is the worst case rather than a truncated knowledge base.
 #[derive(Debug, Clone)]
 pub struct KnowledgeBase {
     path: PathBuf,
@@ -36,7 +31,7 @@ impl KnowledgeBase {
         &self.path
     }
 
-    /// The source text, as loaded. Exposed so it can be served as an MCP resource: a model that
+    /// The source text, as loaded. Exposed so it can be served as an MCP resource: a client that
     /// can read the rules it is calling does not have to take the tool descriptions on faith.
     pub fn source(&self) -> &str {
         &self.source
@@ -45,6 +40,29 @@ impl KnowledgeBase {
     /// Consults the source into a fresh interpreter.
     pub fn parse(&self) -> Interpreter {
         Interpreter::load(&self.source)
+    }
+
+    /// Consults the source into up to `count` machines answering in parallel — but only when the
+    /// knowledge base cannot change under itself, since a change reaches the machine that made it
+    /// and no other.
+    ///
+    /// Deciding this from the source rather than from a flag means a pool is never something a
+    /// user can switch on incorrectly: a file containing `assertz` simply gets one machine.
+    pub fn parse_pool(&self, count: usize) -> Interpreter {
+        if count <= 1 || self.is_self_modifying() {
+            return self.parse();
+        }
+        Interpreter::pool(&self.source, count)
+    }
+
+    /// Whether the source mentions any predicate that changes the database.
+    ///
+    /// Deliberately coarse — a mention inside a comment or a quoted atom counts. Erring towards
+    /// "yes" costs a little parallelism; erring the other way would let two machines disagree
+    /// about what is true, which is not a trade worth making for speed.
+    pub fn is_self_modifying(&self) -> bool {
+        const CHANGERS: [&str; 5] = ["assertz", "asserta", "retractall", "retract", "abolish"];
+        CHANGERS.iter().any(|changer| self.source.contains(changer))
     }
 
     /// The predicates the source documents with a `%!` PlDoc comment.
@@ -99,7 +117,7 @@ impl KnowledgeBase {
     ///
     /// Only lines [`persistence::is_fact_line`] recognises are touched. A line that is a fact of
     /// this predicate but cannot be read back as a term is *kept*: an unparseable line is a
-    /// reason to leave the author's text alone, not to delete it.
+    /// reason to leave the author's text alone rather than delete it.
     fn sync(&mut self, interpreter: &Interpreter, predicate: &DynamicPredicate) -> bool {
         let lines: Vec<&str> = self.source.lines().collect();
         let fact_lines: Vec<usize> = lines
@@ -128,8 +146,8 @@ impl KnowledgeBase {
         }
 
         // Appended after the predicate's last fact line even when that line is itself being
-        // removed — skipping the insertion along with the removal is how a retract-then-assert
-        // in one request used to lose the asserted fact.
+        // removed: skipping the insertion along with the removal would lose the asserted fact of
+        // a retract-then-assert performed in one request.
         let insert_after = fact_lines.last().copied();
         let mut rewritten: Vec<String> = Vec::with_capacity(lines.len() + unmatched.len());
         let mut appended = false;
@@ -156,9 +174,9 @@ impl KnowledgeBase {
 
 /// Writes `contents` to `path` by way of a sibling temporary file and a rename.
 ///
-/// Truncating the real file and writing into it — as this used to — means a crash, a full disk,
-/// or a signal between the two leaves the knowledge base empty or half-written. A rename is
-/// atomic on every platform Charon targets, so a reader either sees the old file or the new one.
+/// Truncating the real file and writing into it would mean a crash, a full disk, or a signal
+/// between the two leaves the knowledge base empty or half-written. A rename is atomic on every
+/// platform Charon targets, so a reader either sees the whole old file or the whole new one.
 fn replace_atomically(path: &Path, contents: &str) -> io::Result<()> {
     let directory = path
         .parent()
@@ -288,8 +306,8 @@ mod tests {
     #[test]
     fn an_assert_after_removing_the_last_fact_line_is_still_written() {
         // The insertion point is the predicate's last fact line. When that very line is the one
-        // being retracted, the append used to be skipped along with it and the new fact
-        // vanished — visibly only when the file happened to hold exactly one fact.
+        // being retracted, the append must not be skipped along with it, or the new fact
+        // vanishes — visibly only when the file happens to hold exactly one fact.
         let file = TempFile::new("append_after_removal", ":- dynamic(only/1).\nonly(a).\n");
         let on_disk = round_trip(&file, "retract(only(a)), assertz(only(b)).");
 
@@ -317,7 +335,7 @@ mod tests {
     #[test]
     fn leaves_clauses_of_a_different_arity_alone() {
         // `example/2` is nobody's business here: `:- dynamic(example/1).` says nothing about it,
-        // and a source line matching only on the functor used to get it deleted.
+        // and a source line matching only on the functor must not get it deleted.
         let file = TempFile::new(
             "other_arity",
             ":- dynamic(example/1).\nexample(a).\nexample(a, b).\n",
@@ -375,7 +393,7 @@ mod tests {
     #[test]
     fn a_read_only_knowledge_base_still_loads() {
         // Serving a `.pl` file nobody may write is entirely reasonable; opening it read-write at
-        // load time made it impossible.
+        // load time would make it impossible.
         let file = TempFile::new("read_only", "example(a).\n");
         let mut permissions = fs::metadata(&file.0).unwrap().permissions();
         permissions.set_readonly(true);
@@ -396,5 +414,27 @@ mod tests {
     fn a_missing_file_names_itself_in_the_error() {
         let error = KnowledgeBase::load("/nonexistent/charon/kb.pl").unwrap_err();
         assert!(error.to_string().contains("/nonexistent/charon/kb.pl"));
+    }
+
+    #[test]
+    fn a_source_that_changes_itself_is_recognised() {
+        // Deliberately coarse: erring towards "yes" costs a little parallelism, while erring the
+        // other way would let two machines disagree about what is true.
+        let pure = TempFile::new("pure", "double(X, Y) :- Y is X * 2.\n");
+        assert!(!KnowledgeBase::load(&pure.0).unwrap().is_self_modifying());
+
+        for source in [
+            "f(X) :- assertz(g(X)).\n",
+            "f(X) :- asserta(g(X)).\n",
+            "f(X) :- retract(g(X)).\n",
+            "f(X) :- retractall(g(X)).\n",
+            "f :- abolish(g/1).\n",
+        ] {
+            let scratch = TempFile::new("changes", source);
+            assert!(
+                KnowledgeBase::load(&scratch.0).unwrap().is_self_modifying(),
+                "{source}"
+            );
+        }
     }
 }
