@@ -1,6 +1,8 @@
 //! The HTTP adapter: routing, argument extraction, and status codes.
 
+mod cors;
 pub mod openapi;
+mod origin;
 mod problem;
 mod serve;
 
@@ -20,6 +22,7 @@ use crate::service::{KeyError, Operation, Service, Verb, value_from_text};
 
 use problem::{Kind, Problem};
 
+pub use origin::is_local_origin;
 pub use problem::PROBLEM_JSON;
 pub use serve::{ServeError, serve, serve_reloadable};
 
@@ -57,6 +60,9 @@ pub fn routes(service: Arc<Service>) -> Router {
             service,
             openapi: Arc::new(openapi::Cache::default()),
         })
+        // Outside the routes, so that it also sees `OPTIONS` — a verb no predicate is exposed
+        // under, and which the router would therefore answer with 405.
+        .layer(axum::middleware::from_fn(cors::allow_local_pages))
 }
 
 /// What every handler is given: the service, and the document rendered from its catalog.

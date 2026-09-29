@@ -432,3 +432,118 @@ async fn openapi_is_cached_and_revalidates() {
         .await;
     revalidated.assert_status(StatusCode::NOT_MODIFIED);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Letting a local page read the interface
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_local_page_may_read_a_response() {
+    let server = http_server("api_test.pl");
+
+    let response = server
+        .get("/list_length")
+        .add_query_param("List", "[1, 2, 3]")
+        .add_header("origin", "http://localhost:8080")
+        .await;
+
+    response.assert_status_ok();
+    assert_eq!(
+        response.header("access-control-allow-origin"),
+        "http://localhost:8080",
+        "a page on this machine should be allowed to read the answer"
+    );
+}
+
+#[tokio::test]
+async fn a_page_on_the_open_web_may_not_read_a_response() {
+    let server = http_server("api_test.pl");
+
+    let response = server
+        .get("/list_length")
+        .add_query_param("List", "[1, 2, 3]")
+        .add_header("origin", "https://evil.example")
+        .await;
+
+    // The query still ran — CORS governs what the browser hands back to the script, not what the
+    // server is willing to compute. What matters is that the permission is absent.
+    response.assert_status_ok();
+    assert!(
+        response
+            .maybe_header("access-control-allow-origin")
+            .is_none(),
+        "a remote origin must not be granted read access to an unauthenticated server"
+    );
+}
+
+#[tokio::test]
+async fn a_response_varies_on_the_origin_that_asked() {
+    let server = http_server("api_test.pl");
+
+    let response = server
+        .get("/list_length")
+        .add_query_param("List", "[1, 2, 3]")
+        .add_header("origin", "https://evil.example")
+        .await;
+
+    // Set even when the origin was refused: a shared cache that missed this would happily replay
+    // the permitted response to an origin that was never granted it.
+    assert_eq!(response.header("vary"), "origin");
+}
+
+#[tokio::test]
+async fn a_preflight_is_answered_rather_than_routed() {
+    let server = http_server("api_test.pl");
+
+    // `OPTIONS` is not a verb any predicate is exposed under, so reaching the router at all would
+    // make this a 405 and every cross-origin body-carrying request impossible.
+    let response = server
+        .method(axum::http::Method::OPTIONS, "/list_length")
+        .add_header("origin", "http://127.0.0.1:5173")
+        .await;
+
+    response.assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.header("access-control-allow-origin"),
+        "http://127.0.0.1:5173"
+    );
+    assert!(
+        response
+            .header("access-control-allow-methods")
+            .to_str()
+            .unwrap()
+            .contains("POST"),
+        "a preflight should name the methods a local page may use"
+    );
+}
+
+#[tokio::test]
+async fn a_preflight_from_the_open_web_is_refused() {
+    let server = http_server("api_test.pl");
+
+    let response = server
+        .method(axum::http::Method::OPTIONS, "/list_length")
+        .add_header("origin", "https://evil.example")
+        .await;
+
+    response.assert_status(StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_request_without_an_origin_is_left_alone() {
+    let server = http_server("api_test.pl");
+
+    // CORS is a browser mechanism. curl, a script or another server never asked, and answering
+    // as though they had would only obscure who the policy is for.
+    let response = server
+        .get("/list_length")
+        .add_query_param("List", "[1, 2, 3]")
+        .await;
+
+    response.assert_status_ok();
+    assert!(
+        response
+            .maybe_header("access-control-allow-origin")
+            .is_none()
+    );
+}
