@@ -11,8 +11,12 @@
             "settings": {
 				"[rust]": {
 					"editor.formatOnSave": true
+				},
+				"[prolog]": {
+					"executablePath": "scryer-prolog"
 				}
 			}
 		}
-	}
+	},
+	"onCreateCommand": "sudo apt update && sudo apt install pkg-config && cargo install --locked --git https://github.com/mthom/scryer-prolog.git"
 }
