@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Scrape every EUDAMED device into raw gzipped JSONL, then build a SQLite database from it.
+"""Download every EUDAMED device into raw gzipped JSONL, then build a SQLite database from it.
 
 Each phase is resumable: finished page files are skipped, so re-running a phase only fetches what is missing.
 Standard library only. See EUDAMED/CLAUDE.md for the API behaviour this relies on.
 
-    python3 -u EUDAMED/scrape.py official                         # does the official /udi serve devices yet?
-    python3 -u EUDAMED/scrape.py list   [--pages 0-2] [--workers 4]
-    python3 -u EUDAMED/scrape.py detail [--pages 0-2] [--workers 4]
-    python3 -u EUDAMED/scrape.py basic  [--pages 0-2] [--workers 4]
-    python3 -u EUDAMED/scrape.py actors
-    python3 -u EUDAMED/scrape.py build                            # data/eudamed.sqlite from the raw files
-    python3 -u EUDAMED/scrape.py verify [--pages 0-2]             # exits 1 on gaps
+    python3 -u EUDAMED/fetch.py official                         # does the official /udi serve devices yet?
+    python3 -u EUDAMED/fetch.py list   [--pages 0-2] [--workers 4]
+    python3 -u EUDAMED/fetch.py detail [--pages 0-2] [--workers 4]
+    python3 -u EUDAMED/fetch.py basic  [--pages 0-2] [--workers 4]
+    python3 -u EUDAMED/fetch.py actors
+    python3 -u EUDAMED/fetch.py build                            # data/eudamed.sqlite from the raw files
+    python3 -u EUDAMED/fetch.py verify [--pages 0-2]             # exits 1 on gaps
 """
 import argparse
 import gzip

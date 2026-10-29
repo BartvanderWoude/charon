@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Offline self-check of scrape.py's build and Basic UDI-DI assignment: python3 EUDAMED/test_scrape.py"""
+"""Offline self-check of fetch.py's build and Basic UDI-DI assignment: python3 EUDAMED/test_fetch.py"""
 import sqlite3
 import tempfile
 from argparse import Namespace
 from pathlib import Path
 
-from scrape import basic_owners, cmd_build, name, write
+from fetch import basic_owners, cmd_build, name, write
 
 RISK = {"code": "refdata.risk-class.class-i"}
 

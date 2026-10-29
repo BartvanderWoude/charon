@@ -69,7 +69,7 @@ paging (`$after=` inside `nextLink`; follow the link rather than building it you
   The rows are flat (`ACTOR_ID` = SRN, address, PRRC name).
 - **`/udi` returns `{"value": []}` for every query**, including no filter, `MF_SRN`, `PRIMARY_DI`, `BASIC_UDI` and
   `RISK_CLASS_ID`, even for devices and manufacturers the website shows. A community MCP server reported it working
-  on 2026-10-14. Re-check before each scrape: if `/udi` is back, use it instead of the website backend (official,
+  on 2026-10-14. Re-check before each full download: if `/udi` is back, use it instead of the website backend (official,
   cursor-paged, 1000 rows per page, CSV available).
 - `/reference?CODE=RISK_CLASS_ID&LANGUAGE=en` lists the 13 risk classes, which is how the partition below was found.
 
@@ -111,7 +111,7 @@ Measured 2026-10-28 by `probe_scale.py` and ad-hoc calls.
   Commission reuse policy (Decision 2011/833/EU) allows reuse unless a site says otherwise. Search-list rows are mostly
   company data, but actor rows from `/actors` include named people (PRRC names, emails), which brings in GDPR.
 
-### Recommendation for the scraper
+### Recommendation for the download
 1. First call the official `/udi`. If it returns rows, use it (cursor via `nextLink`, 1000 rows per page, CSV) and skip the rest.
 2. Otherwise, page `/devices/udiDiData` in the default order with `size=300`, `page=0..totalPages-1`, using
    `check_api.get()` in a `ThreadPoolExecutor(4)`. Write one JSONL file per page and skip pages already on disk, so
@@ -127,14 +127,14 @@ Measured 2026-10-28 by `probe_scale.py` and ad-hoc calls.
 - One request every 3 s, 4 s or 6 s: 30 out of 30 OK. One request per second starts failing after about 17
   requests. So the sustained budget is roughly 20 per minute. 1 per 2 s has not been tested.
 - `check_api.get()` retries 429 after `Retry-After`. `check_api.min_interval` paces every request
-  across threads, and `scrape.py --rate` sets it (default 18 per minute).
-- **What this means for a full scrape at ~18 per minute** (about 26k requests per day):
+  across threads, and `fetch.py --rate` sets it (default 18 per minute).
+- **What this means for a full download at ~18 per minute** (about 26k requests per day):
   - list: 15,399 requests. Bounded by deep-page latency, so about 1 day, as measured above.
   - Basic UDI-DI: one request per distinct Basic UDI-DI. That is about 16% of UDI-DIs in a 900-row sample, so about
     740k requests, about **4 weeks**.
   - UDI-DI detail: 4.6M requests, about **6 months**.
 
-## `scrape.py`
+## `fetch.py`
 It keeps raw gzipped JSONL in `EUDAMED/data/` (gitignored) and builds `data/eudamed.sqlite` from it. Every phase can
 be resumed:
 - Finished page files are skipped.
@@ -142,19 +142,19 @@ be resumed:
 - A page that fails transiently is left for the next run.
 - A 4xx on a single item is written as an `{"uuid"|"ulid": …, "error": …}` record.
 ```sh
-python3 -u EUDAMED/scrape.py official      # /udi still empty? (if not, switch to the official API)
-python3 -u EUDAMED/scrape.py list          # data/list/page-NNNNN.jsonl.gz + meta.json (totals at start/end)
-python3 -u EUDAMED/scrape.py detail        # data/detail/page-NNNNN.jsonl.gz, one detail per list row
-python3 -u EUDAMED/scrape.py basic         # data/basic/…, each Basic UDI-DI once, on the first list page it appears on
-python3 -u EUDAMED/scrape.py actors        # data/actors.jsonl.gz from the official /actors (PRRC person fields dropped)
-python3 -u EUDAMED/scrape.py build         # data/eudamed.sqlite: udi_di, udi_cnd, basic_udi_di, actor
-python3 -u EUDAMED/scrape.py verify        # coverage report, exits 1 on gaps
+python3 -u EUDAMED/fetch.py official      # /udi still empty? (if not, switch to the official API)
+python3 -u EUDAMED/fetch.py list          # data/list/page-NNNNN.jsonl.gz + meta.json (totals at start/end)
+python3 -u EUDAMED/fetch.py detail        # data/detail/page-NNNNN.jsonl.gz, one detail per list row
+python3 -u EUDAMED/fetch.py basic         # data/basic/…, each Basic UDI-DI once, on the first list page it appears on
+python3 -u EUDAMED/fetch.py actors        # data/actors.jsonl.gz from the official /actors (PRRC person fields dropped)
+python3 -u EUDAMED/fetch.py build         # data/eudamed.sqlite: udi_di, udi_cnd, basic_udi_di, actor
+python3 -u EUDAMED/fetch.py verify        # coverage report, exits 1 on gaps
 ```
 - Options: `--pages 0-2` limits any phase to those list pages, `--workers` defaults to 4, and `--rate` defaults to 18
   requests per minute.
 - Each table keeps the full raw object in a `json` or `detail_json` column. Query anything else with `json_extract` or
   `json_each`. For example, markets are in `json_each(detail_json, '$.marketInfoLink.msWhereAvailable')`.
-- `python3 EUDAMED/test_scrape.py` is an offline self-check of `build` and the Basic UDI-DI assignment.
+- `python3 EUDAMED/test_fetch.py` is an offline self-check of `build` and the Basic UDI-DI assignment.
 
 ## `check_api.py`
 ```sh
