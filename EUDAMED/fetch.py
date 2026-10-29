@@ -11,6 +11,9 @@ Standard library only. See EUDAMED/CLAUDE.md for the API behaviour this relies o
     python3 -u EUDAMED/fetch.py actors
     python3 -u EUDAMED/fetch.py build                            # data/eudamed.sqlite from the raw files
     python3 -u EUDAMED/fetch.py verify [--pages 0-2]             # exits 1 on gaps
+
+Any fetching phase takes --proxies FILE (one HTTP proxy URL per line, # for comments), or reads
+EUDAMED_PROXIES (comma-separated). Workers take proxies round-robin; --rate stays shared across all of them.
 """
 import argparse
 import gzip
@@ -18,6 +21,7 @@ import json
 import sqlite3
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +32,9 @@ from check_api import HttpError, get
 SEARCH = "/devices/udiDiData"
 OFFICIAL = "https://api.datalake.sante.service.ec.europa.eu/eudamed"
 SIZE = 300
+# 4xx codes that say nothing about the item itself (blocked exit IP, proxy auth, timeout, rate limit after all
+# retries). These fail the page so the next run retries it, instead of being saved as permanent error records.
+TRANSIENT = {403, 407, 408, 429}
 
 
 def name(n):
@@ -54,9 +61,15 @@ def list_pages(data, pages=None):
     return [(n, p) for n, p in found if pages is None or n in pages]
 
 
+def status(msg):
+    """Live progress on stderr, so it shows in the terminal while stdout goes to a log."""
+    print(msg, file=sys.stderr, flush=True)
+
+
 def run(todo, fn, workers):
     """Run fn(page) for every page in todo. A failed page is logged and left for the next run."""
     start, done, failed = time.time(), 0, []
+    status(f"{len(todo)} pages to fetch with {workers} workers")
     pool = ThreadPoolExecutor(workers)
     try:
         futures = {pool.submit(fn, n): n for n in todo}
@@ -67,21 +80,25 @@ def run(todo, fn, workers):
             except Exception as e:
                 failed.append(futures[f])
                 print(f"page {futures[f]} failed, retry by re-running: {e}", flush=True)
+                status(f"page {futures[f]} failed: {e}")
+            rate = done / (time.time() - start)
+            line = (f"{done}/{len(todo)} pages, {rate * 3600:.0f}/h, eta {(len(todo) - done) / rate / 3600:.1f}h, "
+                    f"{len(failed)} failed")
+            status(f"page {futures[f]} done; {line}")
             if done % 20 == 0 or done == len(todo):
-                rate = done / (time.time() - start)
-                print(f"{done}/{len(todo)} pages, {rate * 3600:.0f}/h, eta {(len(todo) - done) / rate / 3600:.1f}h, "
-                      f"{len(failed)} failed", flush=True)
+                print(line, flush=True)
     finally:
         pool.shutdown(cancel_futures=True)  # Ctrl-C stops promptly instead of draining the queue
     return failed
 
 
 def one(path, key, value):
-    """Fetch one item. A 4xx (withdrawn or unknown) becomes an error record, so its page can still complete."""
+    """Fetch one item. A 4xx about the item (withdrawn or unknown) becomes an error record, so its page can still
+    complete. 5xx and TRANSIENT codes raise, failing the page for the next run."""
     try:
         return get(path, languageIso2Code="en")
     except HttpError as e:
-        if e.code >= 500:
+        if e.code >= 500 or e.code in TRANSIENT:
             raise
         return {key: value, "error": str(e)}
 
@@ -101,7 +118,10 @@ def cmd_list(args):
                 "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
 
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-    meta.setdefault("start", snapshot())
+    if "start" not in meta:
+        status("reading totals from page 0...")
+        meta["start"] = snapshot()
+    status(f"{meta['start']['totalElements']} devices in {meta['start']['totalPages']} pages")
     out.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2))
 
@@ -113,6 +133,7 @@ def cmd_list(args):
 
     pages = args.pages or range(meta["start"]["totalPages"])
     failed = run([n for n in pages if not (out / name(n)).exists()], fetch, args.workers)
+    status("reading totals again for the completeness check...")
     meta["end"] = snapshot()
     meta_path.write_text(json.dumps(meta, indent=2))
     return failed
@@ -241,6 +262,12 @@ def cmd_build(args):
     tmp.replace(db_path)
 
 
+def error_code(msg):
+    """'404' from 'HTTP 404 for ...', else 'other'."""
+    parts = msg.split()
+    return parts[1] if len(parts) > 1 and parts[0] == "HTTP" else "other"
+
+
 def cmd_verify(args):
     gaps = []
 
@@ -267,15 +294,18 @@ def cmd_verify(args):
               f"{total['totalElements']}", len(uuids) < total["totalElements"])
 
     for kind, key, wanted in (("detail", "uuid", uuids), ("basic", "ulid", ulids)):
-        got, errors = set(), 0
+        got, errors = set(), Counter()
         for p in (args.data / kind).glob("page-*.jsonl.gz"):
             for d in read(p):
                 if "error" in d:
-                    errors += 1
+                    errors[error_code(d["error"])] += 1
                 else:
                     got.add(d.get(key))
         # Error records are permanent 4xx (withdrawn/unknown); to retry them, delete their page files and re-run.
-        check(f"{kind}: {len(wanted & got)}/{len(wanted)} fetched, {errors} error records", wanted - got)
+        # Any TRANSIENT codes listed here came from runs before that set existed and are worth retrying.
+        by_code = ", ".join(f"{c}: {k}" for c, k in sorted(errors.items()))
+        check(f"{kind}: {len(wanted & got)}/{len(wanted)} fetched, {sum(errors.values())} error records"
+              + (f" ({by_code})" if by_code else ""), wanted - got)
     sys.exit(1 if gaps else 0)
 
 
@@ -289,10 +319,17 @@ def main():
     p.add_argument("phase", choices=["official", "list", "detail", "basic", "actors", "build", "verify"])
     p.add_argument("--pages", type=pages, help="list page range such as 0-2 (default: all)")
     p.add_argument("--workers", type=int, default=4, help="concurrent pages; raise one step at a time")
-    p.add_argument("--rate", type=float, default=18, help="max requests per minute, shared by all workers")
+    p.add_argument("--rate", type=float, default=60, help="max requests per minute, shared by all workers and proxies")
+    p.add_argument("--proxies", type=Path,
+                   help="file of HTTP proxy URLs, one per line (default: $EUDAMED_PROXIES, else direct)")
     p.add_argument("--data", type=Path, default=Path(__file__).parent / "data")
     args = p.parse_args()
     check_api.min_interval = 60 / args.rate
+    if args.proxies:
+        lines = args.proxies.read_text().splitlines()
+        proxies = [l for l in lines if l.strip() and not l.lstrip().startswith("#")]
+        check_api.set_proxies(proxies)
+        status(f"{len(proxies)} proxies from {args.proxies}")
     failed = globals()[f"cmd_{args.phase}"](args)
     sys.exit(1 if failed else 0)
 

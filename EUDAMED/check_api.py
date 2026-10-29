@@ -5,10 +5,18 @@ Calls the four documented endpoints in a chain (search -> device -> Basic UDI-DI
 and prints PASS / DEVIATION / FAIL per check. Standard library only.
 
     python3 EUDAMED/check_api.py [--tradeName catheter] [--pageSize 300] [--dump DIR]
+
+Proxies (optional): set EUDAMED_PROXIES to a comma-separated list of HTTP proxy URLs, e.g.
+"http://user:pass@1.2.3.4:8080,http://5.6.7.8:3128", or call set_proxies() before starting threads.
+Each thread takes one proxy round-robin and moves to the next after a network error or 5xx.
+Pacing stays global across all proxies. Without a list, urllib's usual HTTPS_PROXY variable still applies
+(enough for a provider gateway that rotates exit IPs itself). SOCKS proxies need a non-stdlib library.
 """
 import argparse
 import http.client
+import itertools
 import json
+import os
 import sys
 import threading
 import time
@@ -36,13 +44,64 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-opener = urllib.request.build_opener(NoRedirect)
 # The gateway answers the default "Python-urllib" User-Agent with 502 Bad Gateway.
 # The official Data Lake API also wants Content-Type on GETs; the website backend ignores it.
-opener.addheaders = [("User-Agent", "eudamed-check/1.0"), ("Accept", "application/json"), ("Content-Type", "application/json")]
+HEADERS = [("User-Agent", "eudamed-check/1.0"), ("Accept", "application/json"), ("Content-Type", "application/json")]
+
+
+def make_opener(proxy=None):
+    """An opener with NoRedirect and HEADERS, routed through proxy if given (else urllib's env-var defaults)."""
+    handlers = [NoRedirect]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    o = urllib.request.build_opener(*handlers)
+    o.addheaders = list(HEADERS)
+    return o
+
+
+opener = make_opener()  # shared direct opener, used when no proxy list is set
+_proxy_lock = threading.Lock()
+_proxy_cycle = None
+_local = threading.local()
+
+
+def set_proxies(proxies):
+    """Hand these proxy URLs out round-robin, one per thread. An empty list means a direct connection.
+    Call before starting worker threads: threads that already picked a proxy keep it until they rotate."""
+    global _proxy_cycle
+    proxies = [p.strip() for p in proxies if p.strip()]
+    with _proxy_lock:
+        _proxy_cycle = itertools.cycle(proxies) if proxies else None
+    _local.opener = None
+
+
+def _label(proxy):
+    """host:port of a proxy URL, without credentials, for error messages."""
+    u = urllib.parse.urlsplit(proxy if "://" in proxy else f"http://{proxy}")
+    return f"{u.hostname}:{u.port}" if u.hostname else "proxy"
+
+
+def _current():
+    """(opener, proxy label or None) for this thread."""
+    if _proxy_cycle is None:
+        return opener, None
+    if getattr(_local, "opener", None) is None:
+        with _proxy_lock:
+            proxy = next(_proxy_cycle)
+        _local.opener, _local.label = make_opener(proxy), _label(proxy)
+    return _local.opener, _local.label
+
+
+def _rotate():
+    """Drop this thread's proxy; its next request takes the next one in the list."""
+    _local.opener = None
+
+
+set_proxies(os.environ.get("EUDAMED_PROXIES", "").split(","))
+
 dump_dir = None
-# Seconds between any two requests, across all threads. The backend allows a burst of ~20, then answers 429 with
-# Retry-After: 60 to every endpoint; one request every 3 s never tripped it. 0 = unpaced (fine for a few calls).
+# Seconds between any two requests, across all threads and proxies. The backend allows a burst of ~20, then answers
+# 429 with Retry-After: 60 to every endpoint; one request every 3 s never tripped it. 0 = unpaced (fine for a few calls).
 min_interval = 0
 _pace_lock = threading.Lock()
 _next_at = 0.0
@@ -65,15 +124,18 @@ class HttpError(RuntimeError):
 
 def get(path, retries=5, **params):
     """GET a JSON resource (a path under BASE, or an absolute URL such as the official API's nextLink).
-    Retries 429 (after Retry-After), 5xx, network errors, timeouts, and the spurious empty search pages."""
+    Retries 429 (after Retry-After), 5xx, network errors, timeouts, and the spurious empty search pages.
+    With proxies set, a network error or 5xx also moves this thread to the next proxy before retrying."""
     url = path if path.startswith("https://") else f"{BASE}{path}"
     if params:
         url += f"?{urllib.parse.urlencode(params)}"
     for attempt in range(retries):
         last = attempt == retries - 1
         pace()
+        o, via = _current()
+        where = f"{url} via {via}" if via else url
         try:
-            with opener.open(url, timeout=60) as r:
+            with o.open(url, timeout=60) as r:
                 body = r.read()
                 if "json" not in r.headers.get("Content-Type", ""):
                     raise ValueError(f"non-JSON response ({r.headers.get('Content-Type')})")
@@ -89,14 +151,20 @@ def get(path, retries=5, **params):
         except urllib.error.HTTPError as e:
             if e.code == 429 and not last:
                 wait = e.headers.get("Retry-After", "60")
+                print(f"429, waiting {wait}s: {where}", file=sys.stderr, flush=True)
                 time.sleep(int(wait) if wait.isdigit() else 60)
                 continue
             if e.code < 500 or last:
-                raise HttpError(e.code, url) from None
-        # OSError covers URLError, timeouts and dropped connections; ValueError covers truncated or non-JSON bodies.
+                raise HttpError(e.code, where) from None
+            print(f"retry {attempt + 1}/{retries - 1} after HTTP {e.code}: {where}", file=sys.stderr, flush=True)
+            _rotate()
+        # OSError covers URLError, timeouts, dropped connections and failed proxy tunnels (e.g. 407 on CONNECT);
+        # ValueError covers truncated or non-JSON bodies (such as a proxy's HTML error page).
         except (OSError, http.client.HTTPException, ValueError) as e:
             if last:
-                raise RuntimeError(f"{e} for {url}") from None
+                raise RuntimeError(f"{e} for {where}") from None
+            print(f"retry {attempt + 1}/{retries - 1} after {e}: {where}", file=sys.stderr, flush=True)
+            _rotate()
         time.sleep(2 * (attempt + 1))
 
 
