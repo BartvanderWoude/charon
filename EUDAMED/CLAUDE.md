@@ -8,6 +8,7 @@ This is the undocumented JSON backend behind the EUDAMED public website, not an 
 - Base URL: `https://ec.europa.eu/tools/eudamed/api`. GET only. No auth. JSON responses.
 - **Send your own `User-Agent`.** The default `Python-urllib/x.y` agent gets `502 Bad Gateway`. Plain curl works.
 - Expect flakiness. Always retry: see Quirks for the empty pages and the random 500/502 errors.
+- **Rate limit: about 20 requests per minute per client, across all endpoints.** See "Rate limit" below.
 
 ## Endpoints
 | Purpose | Path | Notes |
@@ -101,8 +102,8 @@ Measured 2026-10-28 by `probe_scale.py` and ad-hoc calls.
   | 2 | 21.4 s | 11.8 s | ~50 h | 0/12 |
   | 4 | 16.7 s | 6.2 s | **~27 h** | 0/12 |
 
-  Per-request latency did not rise from 1 to 4 workers, so the backend is not throttling at 4. No 429s were seen.
-  Concurrency above 4 is untested. Raise it one step at a time and watch the error rate; this is a public service.
+  Per-request latency did not rise from 1 to 4 workers. No 429s were seen, because deep list pages are slow enough
+  that 4 workers stay under the rate limit (about 12 requests per minute). Fast endpoints do hit it; see below.
 - **Completeness:** offset paging over a run of about a day can shift if devices are added or removed mid-run. Read
   `totalElements` at the start and the end, de-duplicate by `uuid`, and compare the unique count to `totalElements`.
   Only trust an empty page when `page >= totalPages`; `get()` already retries the spurious empty ones.
@@ -119,6 +120,41 @@ Measured 2026-10-28 by `probe_scale.py` and ad-hoc calls.
 4. Possible speed-up, untested: page each of the 13 `riskClassCode` slices separately. If latency follows the offset
    *within* a slice, total cost falls to about a third (Σ slice² / total²). The one comparison made so far (class-I
    page 7000 against global page 7000) was inconclusive, so measure a full slice before relying on it.
+
+## Rate limit (measured 2026-10-28)
+- After a 2-minute cooldown, a burst of **20** fast requests (UDI-DI detail) succeeds. The 21st gets
+  `429` with `Retry-After: 60`, and so does the list search. The bucket is shared by every endpoint.
+- One request every 3 s, 4 s or 6 s: 30 out of 30 OK. One request per second starts failing after about 17
+  requests. So the sustained budget is roughly 20 per minute. 1 per 2 s has not been tested.
+- `check_api.get()` retries 429 after `Retry-After`. `check_api.min_interval` paces every request
+  across threads, and `scrape.py --rate` sets it (default 18 per minute).
+- **What this means for a full scrape at ~18 per minute** (about 26k requests per day):
+  - list: 15,399 requests. Bounded by deep-page latency, so about 1 day, as measured above.
+  - Basic UDI-DI: one request per distinct Basic UDI-DI. That is about 16% of UDI-DIs in a 900-row sample, so about
+    740k requests, about **4 weeks**.
+  - UDI-DI detail: 4.6M requests, about **6 months**.
+
+## `scrape.py`
+It keeps raw gzipped JSONL in `EUDAMED/data/` (gitignored) and builds `data/eudamed.sqlite` from it. Every phase can
+be resumed:
+- Finished page files are skipped.
+- Files are written to `.tmp` and then renamed.
+- A page that fails transiently is left for the next run.
+- A 4xx on a single item is written as an `{"uuid"|"ulid": …, "error": …}` record.
+```sh
+python3 -u EUDAMED/scrape.py official      # /udi still empty? (if not, switch to the official API)
+python3 -u EUDAMED/scrape.py list          # data/list/page-NNNNN.jsonl.gz + meta.json (totals at start/end)
+python3 -u EUDAMED/scrape.py detail        # data/detail/page-NNNNN.jsonl.gz, one detail per list row
+python3 -u EUDAMED/scrape.py basic         # data/basic/…, each Basic UDI-DI once, on the first list page it appears on
+python3 -u EUDAMED/scrape.py actors        # data/actors.jsonl.gz from the official /actors (PRRC person fields dropped)
+python3 -u EUDAMED/scrape.py build         # data/eudamed.sqlite: udi_di, udi_cnd, basic_udi_di, actor
+python3 -u EUDAMED/scrape.py verify        # coverage report, exits 1 on gaps
+```
+- Options: `--pages 0-2` limits any phase to those list pages, `--workers` defaults to 4, and `--rate` defaults to 18
+  requests per minute.
+- Each table keeps the full raw object in a `json` or `detail_json` column. Query anything else with `json_extract` or
+  `json_each`. For example, markets are in `json_each(detail_json, '$.marketInfoLink.msWhereAvailable')`.
+- `python3 EUDAMED/test_scrape.py` is an offline self-check of `build` and the Basic UDI-DI assignment.
 
 ## `check_api.py`
 ```sh
